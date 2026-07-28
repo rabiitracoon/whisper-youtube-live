@@ -3,7 +3,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from lecture_scribe.audio_edit import (
     build_included_ranges,
@@ -27,7 +27,13 @@ from lecture_scribe.prompting import PromptContext, render_prompt, validate_prom
 from lecture_scribe.quality import assess_transcript
 from lecture_scribe.time_range import format_timecode, parse_timecode, validate_clip_range
 from lecture_scribe.transcription import TranscriptResult, TranscriptSegment
-from lecture_scribe.youtube import VideoInfo, format_duration, is_youtube_url
+from lecture_scribe.youtube import (
+    VideoInfo,
+    _is_http_403,
+    download_audio,
+    format_duration,
+    is_youtube_url,
+)
 
 
 class UrlTests(unittest.TestCase):
@@ -40,6 +46,37 @@ class UrlTests(unittest.TestCase):
         self.assertFalse(is_youtube_url("https://example.com/watch?v=abc123"))
         self.assertFalse(is_youtube_url("javascript:alert(1)"))
         self.assertFalse(is_youtube_url("youtube.com/watch?v=abc123"))
+
+    def test_identifies_wrapped_http_403_download_errors(self) -> None:
+        wrapped = RuntimeError("download failed")
+        wrapped.__cause__ = OSError("HTTP Error 403: Forbidden")
+        self.assertTrue(_is_http_403(wrapped))
+        self.assertFalse(_is_http_403(RuntimeError("HTTP Error 429")))
+
+    def test_download_retries_http_403_with_mweb_client(self) -> None:
+        from yt_dlp.utils import DownloadError
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            downloaded = root / "video.mp4"
+            downloaded.write_bytes(b"audio")
+            first = MagicMock()
+            first.__enter__.return_value.extract_info.side_effect = DownloadError(
+                "HTTP Error 403: Forbidden"
+            )
+            second = MagicMock()
+            second.__enter__.return_value.extract_info.return_value = {
+                "requested_downloads": [{"filepath": str(downloaded)}]
+            }
+            with patch("yt_dlp.YoutubeDL", side_effect=[first, second]) as ydl:
+                result = download_audio("https://youtu.be/video", "video", root)
+
+            self.assertEqual(result, downloaded.resolve())
+            fallback_options = ydl.call_args_list[1].args[0]
+            self.assertEqual(
+                fallback_options["extractor_args"]["youtube"]["player_client"],
+                ["mweb"],
+            )
 
 
 class FormattingTests(unittest.TestCase):

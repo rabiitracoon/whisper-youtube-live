@@ -25,6 +25,12 @@ function Resolve-Python {
         }
     } catch {}
     try {
+        $Resolved = & py.exe -3 -c "import sys; print(sys.executable)" 2>$null
+        if ($LASTEXITCODE -eq 0 -and $Resolved) {
+            return $Resolved.Trim()
+        }
+    } catch {}
+    try {
         $Resolved = & python.exe -c "import sys; print(sys.executable)" 2>$null
         if ($LASTEXITCODE -eq 0 -and $Resolved) {
             return $Resolved.Trim()
@@ -55,7 +61,20 @@ if (-not $PythonExe) {
 Write-Host "Python: $PythonExe" -ForegroundColor Green
 
 Write-Step "Creating the private Python environment"
-if (-not (Test-Path -LiteralPath $VenvPython)) {
+$VenvHealthy = $false
+if (Test-Path -LiteralPath $VenvPython) {
+    try {
+        & $VenvPython -c "import sys; raise SystemExit(0 if sys.prefix != sys.base_prefix else 1)"
+        $VenvHealthy = $LASTEXITCODE -eq 0
+    } catch {
+        $VenvHealthy = $false
+    }
+}
+if (-not $VenvHealthy) {
+    if (Test-Path -LiteralPath $VenvRoot) {
+        Write-Host "The existing .venv is broken or belongs to another Python installation. Recreating it." -ForegroundColor Yellow
+        Remove-Item -LiteralPath $VenvRoot -Recurse -Force
+    }
     & $PythonExe -m venv $VenvRoot
     if ($LASTEXITCODE -ne 0) { throw "Failed to create .venv." }
 }

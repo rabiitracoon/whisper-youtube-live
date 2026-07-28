@@ -125,6 +125,7 @@ def download_audio(
     cancel_event: Event | None = None,
 ) -> Path:
     from yt_dlp import YoutubeDL
+    from yt_dlp.utils import DownloadError
 
     destination.mkdir(parents=True, exist_ok=True)
     options = _base_options(cookie_browser, log)
@@ -137,8 +138,36 @@ def download_audio(
             ],
         }
     )
-    with YoutubeDL(options) as ydl:
-        data = ydl.extract_info(url.strip(), download=True)
+    try:
+        with YoutubeDL(options) as ydl:
+            data = ydl.extract_info(url.strip(), download=True)
+    except DownloadError as exc:
+        if not _is_http_403(exc):
+            raise
+        if log:
+            log(
+                "YouTube가 기본 오디오 요청을 거부했습니다. "
+                "모바일 웹 재생 경로로 다시 시도합니다."
+            )
+        fallback_options = dict(options)
+        fallback_options.update(
+            {
+                "format": "bestaudio/best",
+                "extractor_args": {
+                    "youtube": {"player_client": ["mweb"]}
+                },
+                "continuedl": False,
+            }
+        )
+        try:
+            with YoutubeDL(fallback_options) as ydl:
+                data = ydl.extract_info(url.strip(), download=True)
+        except DownloadError as fallback_exc:
+            raise RuntimeError(
+                "YouTube가 기본 경로와 모바일 웹 경로의 오디오 다운로드를 모두 거부했습니다. "
+                "앱 설정에서 로그인된 브라우저 쿠키를 선택한 뒤 다시 시도하세요. "
+                "그래도 실패하면 이 영상 또는 네트워크에는 PO Token Provider가 필요합니다."
+            ) from fallback_exc
 
     candidates: list[Path] = []
     for item in (data or {}).get("requested_downloads", []):
@@ -151,6 +180,19 @@ def download_audio(
         if candidate.exists() and candidate.suffix not in {".part", ".ytdl"}:
             return candidate.resolve()
     raise FileNotFoundError("다운로드는 완료되었지만 오디오 파일을 찾지 못했습니다.")
+
+
+def _is_http_403(error: BaseException) -> bool:
+    """Return whether yt-dlp's wrapped error represents a denied media URL."""
+    current: BaseException | None = error
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        message = str(current).lower()
+        if "http error 403" in message or "403: forbidden" in message:
+            return True
+        current = current.__cause__ or current.__context__
+    return False
 
 
 def _progress_hook(
