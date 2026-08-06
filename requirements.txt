@@ -1,5 +1,6 @@
 PySide6>=6.8,<7
 faster-whisper>=1.2.1,<2
 yt-dlp[default]>=2026.1.1
+imageio-ffmpeg>=0.6,<1
 packaging>=24.2
 
