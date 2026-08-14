@@ -13,7 +13,7 @@ LOCAL_CODEX_ROOT = PROJECT_ROOT / "tools" / "codex-cli"
 
 
 def safe_filename(value: str, max_length: int = 80) -> str:
-    """Return a Windows-safe, readable file or directory name."""
+    """Return a portable, readable file or directory name."""
     cleaned = re.sub(r'[<>:"/\\|?*\x00-\x1f]', " ", value)
     cleaned = re.sub(r"\s+", " ", cleaned).strip(" .")
     return (cleaned or "untitled")[:max_length].rstrip(" .")

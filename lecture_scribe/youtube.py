@@ -1,12 +1,11 @@
 from __future__ import annotations
 
+import shutil
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-import shutil
 from threading import Event
-from typing import Callable
 from urllib.parse import urlparse
-
 
 ProgressCallback = Callable[[float, str], None]
 LogCallback = Callable[[str], None]
@@ -134,7 +133,11 @@ def download_audio(
             "format": "bestaudio/best",
             "outtmpl": str(destination / f"{video_id}.%(ext)s"),
             "progress_hooks": [
-                _progress_hook(progress=progress, cancel_event=cancel_event)
+                _progress_hook(
+                    progress=progress,
+                    cancel_event=cancel_event,
+                    media_label="오디오",
+                )
             ],
         }
     )
@@ -182,6 +185,82 @@ def download_audio(
     raise FileNotFoundError("다운로드는 완료되었지만 오디오 파일을 찾지 못했습니다.")
 
 
+def download_video(
+    url: str,
+    video_id: str,
+    destination: Path,
+    cookie_browser: str = "none",
+    progress: ProgressCallback | None = None,
+    log: LogCallback | None = None,
+    cancel_event: Event | None = None,
+) -> Path:
+    """Download a maximum-1080p video with audio and merge it as MP4."""
+    import imageio_ffmpeg
+    from yt_dlp import YoutubeDL
+    from yt_dlp.utils import DownloadError
+
+    destination.mkdir(parents=True, exist_ok=True)
+    options = _base_options(cookie_browser, log)
+    options.update(
+        {
+            "format": "bv*[height<=1080]+ba/b[height<=1080]/best",
+            "merge_output_format": "mp4",
+            "ffmpeg_location": imageio_ffmpeg.get_ffmpeg_exe(),
+            "outtmpl": str(destination / "original_video.%(ext)s"),
+            "progress_hooks": [
+                _progress_hook(
+                    progress=progress,
+                    cancel_event=cancel_event,
+                    media_label="영상",
+                )
+            ],
+        }
+    )
+    try:
+        with YoutubeDL(options) as ydl:
+            data = ydl.extract_info(url.strip(), download=True)
+    except DownloadError as exc:
+        if not _is_http_403(exc):
+            raise
+        if log:
+            log(
+                "YouTube가 기본 영상 요청을 거부했습니다. "
+                "모바일 웹 재생 경로로 다시 시도합니다."
+            )
+        fallback_options = dict(options)
+        fallback_options.update(
+            {
+                "format": "best[height<=1080]/best",
+                "extractor_args": {"youtube": {"player_client": ["mweb"]}},
+                "continuedl": False,
+            }
+        )
+        try:
+            with YoutubeDL(fallback_options) as ydl:
+                data = ydl.extract_info(url.strip(), download=True)
+        except DownloadError as fallback_exc:
+            raise RuntimeError(
+                "YouTube가 기본 경로와 모바일 웹 경로의 영상 다운로드를 모두 거부했습니다. "
+                "앱 설정에서 로그인된 브라우저 쿠키를 선택한 뒤 다시 시도하세요."
+            ) from fallback_exc
+
+    candidates: list[Path] = list(destination.glob("original_video.mp4"))
+    for item in (data or {}).get("requested_downloads", []):
+        if item.get("filepath"):
+            candidates.append(Path(item["filepath"]))
+    if data and data.get("_filename"):
+        candidates.append(Path(data["_filename"]))
+    candidates.extend(destination.glob("original_video.*"))
+    for candidate in candidates:
+        if (
+            candidate.exists()
+            and candidate.stem == "original_video"
+            and candidate.suffix not in {".part", ".ytdl"}
+        ):
+            return candidate.resolve()
+    raise FileNotFoundError("다운로드는 완료되었지만 영상 파일을 찾지 못했습니다.")
+
+
 def _is_http_403(error: BaseException) -> bool:
     """Return whether yt-dlp's wrapped error represents a denied media URL."""
     current: BaseException | None = error
@@ -198,6 +277,7 @@ def _is_http_403(error: BaseException) -> bool:
 def _progress_hook(
     progress: ProgressCallback | None,
     cancel_event: Event | None,
+    media_label: str = "미디어",
 ) -> Callable[[dict], None]:
     def hook(data: dict) -> None:
         if cancel_event and cancel_event.is_set():
@@ -206,7 +286,7 @@ def _progress_hook(
             return
         status = data.get("status")
         if status == "finished":
-            progress(1.0, "오디오 다운로드 완료")
+            progress(1.0, f"{media_label} 다운로드 완료")
             return
         if status != "downloading":
             return
@@ -215,7 +295,7 @@ def _progress_hook(
         ratio = min(1.0, downloaded / total) if total else 0.0
         speed = data.get("_speed_str", "").strip()
         eta = data.get("_eta_str", "").strip()
-        detail = "오디오 다운로드 중"
+        detail = f"{media_label} 다운로드 중"
         if speed:
             detail += f" · {speed}"
         if eta:

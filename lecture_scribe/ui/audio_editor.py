@@ -538,7 +538,7 @@ class AudioEditorDialog(QDialog):
         self.player.setSource(QUrl.fromLocalFile(str(request.audio_path)))
 
     def release_media(self) -> None:
-        """Release the Windows media backend's handle to the downloaded source."""
+        """Release the media backend's handle to the downloaded source."""
         if self._media_released:
             return
         self._media_released = True
@@ -934,7 +934,7 @@ class AudioEditorDialog(QDialog):
             QMessageBox.warning(
                 self,
                 "오디오를 재생하지 못했습니다",
-                f"Windows 재생기가 이 파일을 열지 못했습니다. 편집은 계속할 수 있습니다.\n{message}",
+                f"macOS 재생기가 이 파일을 열지 못했습니다. 편집은 계속할 수 있습니다.\n{message}",
             )
 
     def _apply(self) -> None:

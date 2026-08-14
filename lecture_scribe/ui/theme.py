@@ -8,7 +8,12 @@ from PySide6.QtWidgets import QApplication
 
 
 def configure_fonts(app: QApplication) -> None:
-    """Use a crisp native Windows face with complete Korean coverage."""
+    """Use a native Korean-capable face on macOS (with Windows fallback)."""
+    if os.uname().sysname == "Darwin":
+        font = QFont("Apple SD Gothic Neo", 13)
+        font.setStyleStrategy(QFont.StyleStrategy.PreferAntialias)
+        app.setFont(font)
+        return
     windows_root = Path(os.environ.get("WINDIR", "C:/Windows"))
     for candidate in [
         windows_root / "Fonts" / "malgun.ttf",
@@ -34,7 +39,7 @@ APP_STYLE = r"""
 QWidget {
     color: #1A1D2B;
     background: #F4F5F8;
-    font-family: "Malgun Gothic", "Segoe UI Variable", "Segoe UI", sans-serif;
+    font-family: "Apple SD Gothic Neo", "SF Pro Text", "Malgun Gothic", sans-serif;
     font-size: 14px;
 }
 QLabel { background: transparent; }

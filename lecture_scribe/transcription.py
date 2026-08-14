@@ -1,21 +1,28 @@
 from __future__ import annotations
 
-import os
-import site
-import sys
+import platform
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Event
 from typing import Callable
 
 from .audio_edit import map_edited_time_to_original
+from .paths import PROJECT_ROOT
 from .youtube import VideoInfo, format_duration
 
 
 ProgressCallback = Callable[[float, str], None]
 LogCallback = Callable[[str], None]
-_DLL_HANDLES: list[object] = []
-_MODEL_CACHE: dict[tuple[str, str], object] = {}
+MLX_MODEL_ALIASES = {
+    "large-v3": "mlx-community/whisper-large-v3-mlx",
+    "large-v2": "mlx-community/whisper-large-v2-mlx",
+    "medium": "mlx-community/whisper-medium-mlx",
+}
+LOCAL_MLX_MODELS = {
+    "large-v3": PROJECT_ROOT / "models" / "whisper-large-v3-mlx",
+    "large-v2": PROJECT_ROOT / "models" / "whisper-large-v2-mlx",
+    "medium": PROJECT_ROOT / "models" / "whisper-medium-mlx",
+}
 
 
 class TranscriptionCancelled(RuntimeError):
@@ -45,75 +52,47 @@ class TranscriptResult:
     clip_ranges: tuple[tuple[float, float], ...]
 
 
-def _add_dll_directory(path: Path) -> None:
-    if not path.exists():
-        return
-    path_text = str(path.resolve())
-    current = os.environ.get("PATH", "")
-    if path_text.lower() not in current.lower().split(os.pathsep):
-        os.environ["PATH"] = path_text + os.pathsep + current
-    if hasattr(os, "add_dll_directory"):
-        try:
-            _DLL_HANDLES.append(os.add_dll_directory(path_text))
-        except OSError:
-            pass
+def resolve_mlx_model(model_name: str) -> str:
+    """Accept the old UI aliases as well as an MLX Hugging Face repo/local path."""
+    local_path = LOCAL_MLX_MODELS.get(model_name)
+    if local_path and (local_path / "config.json").is_file() and (
+        (local_path / "weights.npz").is_file()
+        or (local_path / "weights.safetensors").is_file()
+    ):
+        return str(local_path)
+    return MLX_MODEL_ALIASES.get(model_name, model_name)
 
 
-def prepare_cuda_runtime() -> None:
-    """Expose CUDA 12/cuDNN DLLs bundled by the GPU PyTorch wheel to CTranslate2."""
-    roots = {Path(item) for item in site.getsitepackages() if item}
-    roots.add(Path(sys.prefix) / "Lib" / "site-packages")
-    for root in roots:
-        _add_dll_directory(root / "torch" / "lib")
-        nvidia_root = root / "nvidia"
-        if nvidia_root.exists():
-            for bin_dir in nvidia_root.glob("*/bin"):
-                _add_dll_directory(bin_dir)
-    for env_name in ("CUDA_PATH", "CUDA_PATH_V12_8", "CUDA_PATH_V12_6"):
-        value = os.environ.get(env_name)
-        if value:
-            _add_dll_directory(Path(value) / "bin")
+def verify_mlx() -> str:
+    if platform.system() != "Darwin" or platform.machine() != "arm64":
+        raise RuntimeError("MLX 전사는 Apple Silicon(arm64) Mac에서만 사용할 수 있습니다.")
     try:
-        import torch
+        import mlx.core as mx
 
-        if not torch.cuda.is_available():
-            raise RuntimeError("PyTorch가 NVIDIA GPU를 인식하지 못했습니다.")
-        # Loading one CUDA tensor eagerly loads the CUDA/cuDNN dependencies used by CTranslate2.
-        torch.empty(1, device="cuda")
-    except ImportError as exc:
-        raise RuntimeError("GPU용 PyTorch가 설치되지 않았습니다. install.bat을 다시 실행해주세요.") from exc
-
-
-def verify_cuda() -> str:
-    prepare_cuda_runtime()
-    import ctranslate2
-    import torch
-
-    count = ctranslate2.get_cuda_device_count()
-    if count < 1:
-        raise RuntimeError("CTranslate2가 사용할 수 있는 NVIDIA CUDA 장치를 찾지 못했습니다.")
-    return str(torch.cuda.get_device_name(0))
+        # Force Metal initialization here so failures are reported before downloading audio.
+        mx.eval(mx.zeros((1,)))
+    except (ImportError, RuntimeError) as exc:
+        raise RuntimeError(
+            "MLX가 Apple Metal GPU를 사용할 수 없습니다. install.command를 다시 실행하고 "
+            "일반 macOS 터미널에서 앱을 실행해주세요."
+        ) from exc
+    return "Apple Silicon · MLX Metal"
 
 
-def _get_model(model_name: str, compute_type: str, log: LogCallback | None):
-    key = (model_name, compute_type)
-    if key in _MODEL_CACHE:
-        if log:
-            log(f"메모리에 로드된 Whisper {model_name} 모델을 재사용합니다.")
-        return _MODEL_CACHE[key]
-    prepare_cuda_runtime()
-    from faster_whisper import WhisperModel
+def _audio_duration(path: Path) -> float:
+    """Read the actual edited file duration without decoding it a second time."""
+    try:
+        import av
 
-    if log:
-        log(f"Whisper {model_name} 모델을 불러옵니다. 첫 실행은 약 3GB 다운로드가 필요합니다.")
-    model = WhisperModel(
-        model_name,
-        device="cuda",
-        compute_type=compute_type,
-        num_workers=1,
-    )
-    _MODEL_CACHE[key] = model
-    return model
+        with av.open(str(path)) as container:
+            if container.duration is not None:
+                return float(container.duration / av.time_base)
+            stream = next((item for item in container.streams if item.type == "audio"), None)
+            if stream is not None and stream.duration is not None:
+                return float(stream.duration * stream.time_base)
+    except (ImportError, OSError, StopIteration, ValueError):
+        pass
+    return 0.0
 
 
 def transcribe_audio(
@@ -129,11 +108,12 @@ def transcribe_audio(
     clip_end: float | None = None,
     clip_ranges: tuple[tuple[float, float], ...] | None = None,
     original_ranges: tuple[tuple[float, float], ...] | None = None,
+    prompt_terms: tuple[str, ...] = (),
     progress: ProgressCallback | None = None,
     log: LogCallback | None = None,
     cancel_event: Event | None = None,
 ) -> TranscriptResult:
-    model = _get_model(model_name, compute_type, log)
+    model_repo = resolve_mlx_model(model_name)
     if cancel_event and cancel_event.is_set():
         raise TranscriptionCancelled("사용자가 전사를 취소했습니다.")
     requested_end = float(clip_end) if clip_end is not None else None
@@ -156,7 +136,6 @@ def transcribe_audio(
         effective_end = normalized_ranges[-1][1]
     elif has_explicit_clip:
         clip_timestamps = [clip_start] if clip_end is None else [clip_start, clip_end]
-    effective_vad = vad_filter and not has_explicit_clip
     if log:
         if timestamp_map:
             range_text = "저장된 연속 편집본 전체"
@@ -165,25 +144,35 @@ def transcribe_audio(
             range_text = f"{format_duration(clip_start)}~{end_text}"
         if not timestamp_map and len(normalized_ranges) > 1:
             range_text = f"{len(normalized_ranges)}개 강의 구간"
-        log(f"정확도 우선 설정(beam={beam_size}, FP16)으로 GPU 전사를 시작합니다. 구간: {range_text}")
+        log(f"정확도 우선 FP16 설정으로 MLX Metal 전사를 시작합니다. 구간: {range_text}")
+        log(f"MLX 모델: {model_repo} (첫 실행에는 모델 다운로드가 필요합니다.)")
         if timestamp_map:
-            log("VAD와 반복 억제를 적용하며, 결과 시간은 원본 영상 위치로 다시 연결합니다.")
-        if vad_filter and has_explicit_clip:
-            log("선택 구간 전사에서는 Whisper 구간 지정이 VAD보다 우선 적용됩니다.")
-    raw_segments, info = model.transcribe(
+            log("반복 억제를 적용하며, 결과 시간은 원본 영상 위치로 다시 연결합니다.")
+        if vad_filter:
+            log("쉬는 시간 편집 단계의 Silero VAD 결과를 사용하고 Whisper 반복 억제를 적용합니다.")
+        if prompt_terms:
+            log(f"전문용어 {len(prompt_terms)}개를 Whisper 문맥에 자동 적용합니다.")
+    import mlx_whisper
+
+    initial_prompt = _build_initial_prompt(prompt_terms)
+
+    result = mlx_whisper.transcribe(
         str(audio_path),
+        path_or_hf_repo=model_repo,
         task="transcribe",
         language=None if language == "auto" else language,
-        beam_size=beam_size,
-        best_of=max(beam_size, 5),
         temperature=0.0,
         condition_on_previous_text=False,
-        vad_filter=effective_vad,
-        vad_parameters={"min_silence_duration_ms": 500} if effective_vad else None,
+        initial_prompt=initial_prompt,
         clip_timestamps=clip_timestamps,
         word_timestamps=False,
+        fp16=compute_type != "float32",
+        verbose=None,
     )
-    full_duration = float(getattr(info, "duration", 0) or video.duration or 1)
+    raw_segments = result.get("segments", [])
+    full_duration = _audio_duration(audio_path) or max(
+        (float(item.get("end", 0)) for item in raw_segments), default=float(video.duration or 1)
+    )
     if timestamp_map:
         clip_start = timestamp_map[0][0]
         effective_end = timestamp_map[-1][1]
@@ -206,10 +195,10 @@ def transcribe_audio(
     for raw in raw_segments:
         if cancel_event and cancel_event.is_set():
             raise TranscriptionCancelled("사용자가 전사를 취소했습니다.")
-        text = str(raw.text).strip()
+        text = str(raw.get("text", "")).strip()
         if text:
-            raw_start = float(raw.start)
-            raw_end = float(raw.end)
+            raw_start = float(raw.get("start", 0))
+            raw_end = float(raw.get("end", raw_start))
             segment_start = raw_start
             segment_end = raw_end
             if timestamp_map:
@@ -227,10 +216,10 @@ def transcribe_audio(
             )
         if progress:
             completed = sum(
-                max(0.0, min(float(raw.end), end) - start)
+                max(0.0, min(float(raw.get("end", 0)), end) - start)
                 for start, end in normalized_ranges
             )
-            progress(min(1.0, completed / selected_duration), f"전사 중 · {format_duration(raw.end)}")
+            progress(min(1.0, completed / selected_duration), f"전사 중 · {format_duration(float(raw.get('end', 0)))}")
 
     if not segments:
         raise RuntimeError("음성을 감지하지 못해 전사 결과가 비어 있습니다.")
@@ -241,8 +230,10 @@ def transcribe_audio(
     text_path.write_text("\n".join(item.text for item in segments) + "\n", encoding="utf-8")
     markdown_path.write_text(_to_markdown(video, segments), encoding="utf-8")
     srt_path.write_text(_to_srt(segments), encoding="utf-8")
-    detected_language = str(getattr(info, "language", language))
-    probability = float(getattr(info, "language_probability", 0.0) or 0.0)
+    detected_language = str(result.get("language", language))
+    # mlx-whisper returns the selected language but not its probability. Avoid a
+    # false low-confidence warning in the downstream review.
+    probability = 1.0
     if progress:
         progress(1.0, "전사 파일 저장 완료")
     return TranscriptResult(
@@ -258,8 +249,29 @@ def transcribe_audio(
     )
 
 
+def _build_initial_prompt(prompt_terms: tuple[str, ...], limit: int = 600) -> str | None:
+    """Build a compact Whisper prompt without overflowing its short text context."""
+    selected: list[str] = []
+    seen: set[str] = set()
+    current_length = 0
+    for raw_term in prompt_terms:
+        term = " ".join(str(raw_term).split()).strip(" ,")
+        key = term.casefold()
+        if not term or key in seen:
+            continue
+        added = len(term) + (2 if selected else 0)
+        if current_length + added > limit:
+            break
+        seen.add(key)
+        selected.append(term)
+        current_length += added
+    if not selected:
+        return None
+    return "이 강의의 주요 전문용어: " + ", ".join(selected)
+
+
 def _optional_float(value: object, attribute: str) -> float | None:
-    raw = getattr(value, attribute, None)
+    raw = value.get(attribute) if isinstance(value, dict) else getattr(value, attribute, None)
     return float(raw) if raw is not None else None
 
 

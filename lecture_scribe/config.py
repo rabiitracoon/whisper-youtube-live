@@ -19,6 +19,9 @@ class AppSettings:
     clip_start_seconds: float = 0.0
     clip_end_seconds: float | None = None
     keep_audio: bool = False
+    keep_video: bool = False
+    auto_terminology: bool = False
+    terminology_lecture_name: str = ""
     cookie_browser: str = "none"
     codex_model: str = "gpt-5.6-sol"
     reasoning_effort: str = "high"

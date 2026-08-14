@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
 from threading import Event
 from time import sleep
-from typing import Callable
 
 from .audio_edit import (
     AudioEditRequest,
@@ -14,15 +14,21 @@ from .audio_edit import (
     extract_waveform,
     render_edited_audio,
 )
-from .codex_client import auth_status, generate_notes
+from .codex_client import auth_status, generate_notes, generate_transcription_terms
 from .config import AppSettings, load_prompt
 from .paths import safe_filename
 from .prompting import PromptContext, render_prompt
 from .quality import TranscriptReview, assess_transcript
 from .time_range import validate_clip_range
-from .transcription import TranscriptResult, transcribe_audio, verify_cuda
-from .youtube import VideoInfo, download_audio, fetch_video_info, format_duration
-
+from .transcription import TranscriptResult, transcribe_audio, verify_mlx
+from .video_edit import render_edited_video
+from .youtube import (
+    VideoInfo,
+    download_audio,
+    download_video,
+    fetch_video_info,
+    format_duration,
+)
 
 ProgressCallback = Callable[[int, str, str], None]
 LogCallback = Callable[[str], None]
@@ -41,6 +47,7 @@ class PipelineResult:
     notes_path: Path | None
     transcript_path: Path | None
     srt_path: Path | None
+    video_path: Path | None
     video_title: str
     completed_stage: str
 
@@ -62,8 +69,10 @@ def run_pipeline(
         if progress:
             progress(max(0, min(100, percent)), stage, detail)
 
-    needs_gpu = target_stage in {"all", "transcribe"}
-    needs_auth = target_stage in {"all", "notes"}
+    needs_transcriber = target_stage in {"all", "transcribe"}
+    needs_auth = target_stage in {"all", "notes"} or (
+        needs_transcriber and settings.auto_terminology
+    )
     emit(1, "사전 점검", "현재 단계에 필요한 환경을 확인합니다.")
     if needs_auth:
         status = auth_status()
@@ -71,10 +80,10 @@ def run_pipeline(
             raise RuntimeError(status.detail)
         if not status.logged_in:
             raise RuntimeError("ChatGPT OAuth 로그인이 필요합니다. 도구 탭에서 로그인해주세요.")
-    if needs_gpu:
-        gpu_name = verify_cuda()
+    if needs_transcriber:
+        accelerator_name = verify_mlx()
         if log:
-            log(f"GPU 확인 완료: {gpu_name}")
+            log(f"전사 가속기 확인 완료: {accelerator_name}")
 
     emit(3, "영상 확인", "YouTube 영상 정보를 읽는 중입니다.")
     video = fetch_video_info(url, settings.cookie_browser, log)
@@ -91,9 +100,30 @@ def run_pipeline(
         log(f"작업 폴더: {job_dir}")
         log(f"재개 가능한 완료 단계: {completed}")
 
+    prompt_terms: tuple[str, ...] = ()
+    if (
+        settings.auto_terminology
+        and needs_transcriber
+        and (target_stage == "transcribe" or "transcribe" not in state["completed_stages"])
+    ):
+        emit(4, "전문용어 준비", "강의명으로 전사 전문용어를 만들고 있습니다.")
+        prompt_terms = _prepare_transcription_terms(
+            job_dir,
+            state,
+            settings,
+            video,
+            log=log,
+            cancel_event=cancel_event,
+        )
+
     audio_path = _state_artifact(job_dir, state, "original_audio")
+    video_path = _state_artifact(job_dir, state, "original_video")
     should_download = target_stage == "download" or (
-        target_stage == "all" and "download" not in state["completed_stages"]
+        target_stage == "all"
+        and (
+            "download" not in state["completed_stages"]
+            or (settings.keep_video and (not video_path or not video_path.exists()))
+        )
     )
     if should_download:
         if audio_path and audio_path.exists():
@@ -107,16 +137,37 @@ def run_pipeline(
                 job_dir,
                 settings.cookie_browser,
                 progress=lambda ratio, detail: emit(
-                    5 + round(ratio * 15), "원본 다운로드", detail
+                    5 + round(ratio * (7 if settings.keep_video else 15)),
+                    "원본 다운로드",
+                    detail,
                 ),
                 log=log,
                 cancel_event=cancel_event,
             )
+        artifacts = {"original_audio": audio_path.name}
+        if settings.keep_video:
+            if video_path and video_path.exists():
+                if log:
+                    log("이미 저장된 원본 영상을 재사용합니다. 다시 다운로드하지 않습니다.")
+            else:
+                emit(12, "원본 영상 다운로드", "최대 1080p 영상과 오디오를 저장합니다.")
+                video_path = download_video(
+                    video.webpage_url,
+                    video.video_id,
+                    job_dir,
+                    settings.cookie_browser,
+                    progress=lambda ratio, detail: emit(
+                        12 + round(ratio * 8), "원본 영상 다운로드", detail
+                    ),
+                    log=log,
+                    cancel_event=cancel_event,
+                )
+            artifacts["original_video"] = video_path.name
         _mark_stage(
             job_dir,
             state,
             "download",
-            artifacts={"original_audio": audio_path.name},
+            artifacts=artifacts,
         )
     elif not audio_path or not audio_path.exists():
         raise RuntimeError(
@@ -127,9 +178,18 @@ def run_pipeline(
         return _make_result(job_dir, video, state, "download")
 
     edited_path = _state_artifact(job_dir, state, "edited_audio")
+    edited_video_path = _state_artifact(job_dir, state, "edited_video")
     should_edit = target_stage == "edit" or (
         target_stage == "all"
-        and ("edit" not in state["completed_stages"] or not edited_path or not edited_path.exists())
+        and (
+            "edit" not in state["completed_stages"]
+            or not edited_path
+            or not edited_path.exists()
+            or (
+                settings.keep_video
+                and (not edited_video_path or not edited_video_path.exists())
+            )
+        )
     )
     if should_edit:
         emit(20, "파형 준비", "저장된 원본에서 파형을 생성합니다.")
@@ -177,6 +237,29 @@ def run_pipeline(
                 f"16 kHz mono FLAC 저장 중 · {ratio:.0%}",
             ),
         )
+        edit_artifacts = {"edited_audio": edited_path.name}
+        if settings.keep_video:
+            video_path = _state_artifact(job_dir, state, "original_video")
+            if not video_path or not video_path.exists():
+                raise RuntimeError(
+                    "저장된 원본 영상이 없습니다. ‘쉬는 시간을 뺀 영상도 보관하기’를 켠 상태로 "
+                    "고급 모드의 ‘1. 원본 다운로드’를 먼저 실행해주세요."
+                )
+            edited_video_path = job_dir / "edited_lecture.mp4"
+            emit(38, "영상 편집본 저장", "쉬는 시간을 제거한 MP4 영상을 만듭니다.")
+            render_edited_video(
+                video_path,
+                edited_video_path,
+                included_ranges,
+                cancel_event=cancel_event,
+                progress=lambda ratio: emit(
+                    38 + round(ratio * 7),
+                    "영상 편집본 저장",
+                    f"H.264 MP4 저장 중 · {ratio:.0%}",
+                ),
+                log=log,
+            )
+            edit_artifacts["edited_video"] = edited_video_path.name
         state["edit"] = {
             "excluded_ranges": [list(item) for item in exclusions],
             "included_ranges": [list(item) for item in included_ranges],
@@ -187,15 +270,27 @@ def run_pipeline(
             job_dir,
             state,
             "edit",
-            artifacts={"edited_audio": edited_path.name},
+            artifacts=edit_artifacts,
         )
-        _write_metadata(job_dir, video, settings, clip_start, clip_end, exclusions, included_ranges)
+        _write_metadata(
+            job_dir,
+            video,
+            settings,
+            clip_start,
+            clip_end,
+            exclusions,
+            included_ranges,
+            original_video=video_path if settings.keep_video else None,
+            edited_video=edited_video_path if settings.keep_video else None,
+        )
         if log:
             removed = sum(end - start for start, end in exclusions)
             log(
                 f"편집본 저장 완료: 쉬는 시간 {len(exclusions)}개, "
                 f"{format_duration(removed)} 제거 · {edited_path.name}"
             )
+            if edited_video_path and edited_video_path.exists():
+                log(f"영상 편집본 저장 완료: {edited_video_path.name}")
     elif not edited_path or not edited_path.exists():
         raise RuntimeError(
             "저장된 편집본이 없습니다. 고급 모드의 ‘2. Razor 편집본 저장’을 먼저 실행해주세요."
@@ -212,7 +307,7 @@ def run_pipeline(
         included_ranges = tuple(
             (float(start), float(end)) for start, end in state["edit"]["included_ranges"]
         )
-        emit(46, "GPU 전사", "저장된 편집본만 Whisper에 전달합니다.")
+        emit(46, "MLX 전사", "저장된 편집본만 Apple Silicon Whisper에 전달합니다.")
         transcript = transcribe_audio(
             audio_path=edited_path,
             output_dir=job_dir,
@@ -220,11 +315,11 @@ def run_pipeline(
             model_name=settings.whisper_model,
             language=settings.language,
             compute_type=settings.compute_type,
-            beam_size=settings.beam_size,
             vad_filter=True,
             original_ranges=included_ranges,
+            prompt_terms=prompt_terms,
             progress=lambda ratio, detail: emit(
-                46 + round(ratio * 34), "GPU 전사", detail
+                46 + round(ratio * 34), "MLX 전사", detail
             ),
             log=log,
             cancel_event=cancel_event,
@@ -254,7 +349,7 @@ def run_pipeline(
         )
     elif "transcribe" not in state["completed_stages"]:
         raise RuntimeError(
-            "확인 완료된 전사본이 없습니다. 고급 모드의 ‘3. GPU 전사’를 먼저 실행해주세요."
+            "확인 완료된 전사본이 없습니다. 고급 모드의 ‘3. MLX 전사’를 먼저 실행해주세요."
         )
     if target_stage == "transcribe":
         emit(100, "전사 완료", "전사본을 저장했습니다. AI 노트 단계부터 이어서 할 수 있습니다.")
@@ -288,6 +383,12 @@ def run_pipeline(
                 _save_checkpoint(job_dir, state)
                 if log:
                     log("전체 완료 후 원본 오디오만 정리했습니다. 편집본은 재전사를 위해 보존합니다.")
+        if settings.keep_video and video_path and video_path.exists():
+            if _remove_original_audio(video_path, log, media_label="영상"):
+                state["artifacts"].pop("original_video", None)
+                _save_checkpoint(job_dir, state)
+                if log:
+                    log("전체 완료 후 원본 영상은 정리하고 쉬는 시간을 뺀 MP4만 보존합니다.")
         emit(100, "완료", "단계별 결과와 강의 노트를 모두 저장했습니다.")
         return _make_result(job_dir, video, state, "notes")
 
@@ -298,8 +399,9 @@ def _remove_original_audio(
     audio_path: Path,
     log: LogCallback | None = None,
     retry_delays: tuple[float, ...] = (0.0, 0.2, 0.5, 1.0, 2.0),
+    media_label: str = "오디오",
 ) -> bool:
-    """Best-effort cleanup that never invalidates already completed notes."""
+    """Best-effort source cleanup that never invalidates completed output."""
     last_error: OSError | None = None
     for delay in retry_delays:
         if delay:
@@ -317,7 +419,7 @@ def _remove_original_audio(
             last_error = exc
     if log:
         log(
-            "원본 오디오가 Windows 미디어 재생기 또는 다른 프로그램에서 사용 중이라 "
+            f"원본 {media_label}가 미디어 재생기 또는 다른 프로그램에서 사용 중이라 "
             f"삭제하지 못했습니다. 결과는 정상 완료됐으며 원본은 그대로 보존합니다: {audio_path} "
             f"({last_error})"
         )
@@ -370,7 +472,63 @@ def _ensure_state(state: dict, video: VideoInfo, settings: AppSettings) -> None:
         "beam_size": settings.beam_size,
         "codex_model": settings.codex_model,
         "reasoning_effort": settings.reasoning_effort,
+        "keep_video": settings.keep_video,
+        "auto_terminology": settings.auto_terminology,
+        "terminology_lecture_name": settings.terminology_lecture_name,
     }
+
+
+def _prepare_transcription_terms(
+    job_dir: Path,
+    state: dict,
+    settings: AppSettings,
+    video: VideoInfo,
+    *,
+    log: LogCallback | None = None,
+    cancel_event: Event | None = None,
+) -> tuple[str, ...]:
+    lecture_name = " ".join(settings.terminology_lecture_name.split()).strip()
+    if not lecture_name:
+        raise ValueError("전문용어 자동 입력을 사용하려면 강의명을 입력해주세요.")
+
+    saved_info = state.get("terminology", {})
+    saved_path = _state_artifact(job_dir, state, "transcription_terms")
+    if (
+        saved_path
+        and saved_path.exists()
+        and saved_info.get("lecture_name") == lecture_name
+    ):
+        terms = tuple(
+            line.strip()
+            for line in saved_path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        )
+        if terms:
+            if log:
+                log(f"저장된 전사 전문용어 {len(terms)}개를 재사용합니다: {saved_path.name}")
+            return terms
+
+    terms = generate_transcription_terms(
+        lecture_name,
+        video_title=video.title,
+        model=settings.codex_model,
+        reasoning_effort="medium",
+        log=log,
+        cancel_event=cancel_event,
+    )
+    terms_path = job_dir / "transcription_terms.txt"
+    terms_path.write_text("\n".join(terms) + "\n", encoding="utf-8")
+    state["terminology"] = {
+        "lecture_name": lecture_name,
+        "count": len(terms),
+    }
+    state.setdefault("artifacts", {})["transcription_terms"] = terms_path.name
+    _save_checkpoint(job_dir, state)
+    if log:
+        preview = ", ".join(terms[:8])
+        suffix = " …" if len(terms) > 8 else ""
+        log(f"전사 전문용어 {len(terms)}개 준비 완료: {preview}{suffix}")
+    return terms
 
 
 def _mark_stage(
@@ -459,6 +617,7 @@ def _make_result(
         notes_path=_state_artifact(job_dir, state, "notes"),
         transcript_path=_state_artifact(job_dir, state, "transcript_markdown"),
         srt_path=_state_artifact(job_dir, state, "transcript_srt"),
+        video_path=_state_artifact(job_dir, state, "edited_video"),
         video_title=video.title,
         completed_stage=completed_stage,
     )
@@ -504,6 +663,8 @@ def _write_metadata(
     clip_end: float | None,
     exclusions: tuple[tuple[float, float], ...] = (),
     included_ranges: tuple[tuple[float, float], ...] = (),
+    original_video: Path | None = None,
+    edited_video: Path | None = None,
 ) -> None:
     data = {
         "video": asdict(video),
@@ -519,10 +680,17 @@ def _write_metadata(
             "excluded_break_ranges": [list(item) for item in exclusions],
             "included_lecture_ranges": [list(item) for item in included_ranges],
             "source": "edited_lecture.flac",
+            "auto_terminology": settings.auto_terminology,
+            "terminology_lecture_name": settings.terminology_lecture_name,
         },
         "notes": {
             "model": settings.codex_model,
             "reasoning_effort": settings.reasoning_effort,
+        },
+        "video_output": {
+            "enabled": settings.keep_video,
+            "original": original_video.name if original_video else None,
+            "edited": edited_video.name if edited_video else None,
         },
     }
     (job_dir / "metadata.json").write_text(

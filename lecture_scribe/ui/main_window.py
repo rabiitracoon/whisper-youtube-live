@@ -15,6 +15,7 @@ from PySide6.QtWidgets import (
     QGraphicsDropShadowEffect,
     QGridLayout,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QMainWindow,
@@ -24,8 +25,8 @@ from PySide6.QtWidgets import (
     QPushButton,
     QScrollArea,
     QSizePolicy,
-    QSpinBox,
     QStackedWidget,
+    QSystemTrayIcon,
     QVBoxLayout,
     QWidget,
 )
@@ -59,7 +60,9 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("Lecture Scribe · 강의를 내 노트로")
         self.setMinimumSize(1080, 720)
         self.resize(1280, 860)
+        self._notification_tray: QSystemTrayIcon | None = None
         self._build_ui()
+        self._setup_notifications()
         self._refresh_local_status()
         QTimer.singleShot(400, lambda: self._run_auth_action("status"))
 
@@ -85,6 +88,52 @@ class MainWindow(QMainWindow):
         workspace_layout.addWidget(self.tabs, 1)
         layout.addWidget(workspace, 1)
         self.setCentralWidget(root)
+
+    def _setup_notifications(self) -> None:
+        icon = QIcon(str(ASSET_DIR / "nav-new.svg"))
+        self.setWindowIcon(icon)
+        app = QApplication.instance()
+        if app is not None:
+            app.setWindowIcon(icon)
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            return
+        tray = QSystemTrayIcon(icon, self)
+        tray.setToolTip("Lecture Scribe")
+        tray.messageClicked.connect(self._restore_from_notification)
+        tray.activated.connect(self._on_tray_activated)
+        tray.show()
+        self._notification_tray = tray
+
+    def _notify_action_required(self, title: str, message: str) -> None:
+        if self.isActiveWindow() and not self.isMinimized():
+            return
+        QApplication.alert(self, 0)
+        if self._notification_tray and self._notification_tray.supportsMessages():
+            self._notification_tray.showMessage(
+                title,
+                message,
+                QSystemTrayIcon.MessageIcon.Information,
+                15_000,
+            )
+
+    def _on_tray_activated(
+        self, reason: QSystemTrayIcon.ActivationReason
+    ) -> None:
+        if reason in {
+            QSystemTrayIcon.ActivationReason.Trigger,
+            QSystemTrayIcon.ActivationReason.DoubleClick,
+        }:
+            self._restore_from_notification()
+
+    def _restore_from_notification(self) -> None:
+        self.tabs.setCurrentIndex(0)
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+        if self.audio_editor is not None:
+            self.audio_editor.showNormal()
+            self.audio_editor.raise_()
+            self.audio_editor.activateWindow()
 
     def _build_sidebar(self) -> QFrame:
         sidebar = QFrame()
@@ -410,6 +459,22 @@ class MainWindow(QMainWindow):
         self.vad_check.setToolTip("강의 중 소리가 거의 없는 구간을 건너뛰어 반복 문장이 생길 가능성을 낮춥니다.")
         options.addWidget(self.vad_check)
 
+        self.auto_terminology_check = QCheckBox("전문용어 자동 입력")
+        self.auto_terminology_check.setChecked(self.settings.auto_terminology)
+        self.auto_terminology_check.setToolTip(
+            "시작할 때 강의명을 입력하면 연결된 GPT가 관련 전문용어를 만들고 "
+            "MLX Whisper 전사 문맥에 자동 적용합니다."
+        )
+        options.addWidget(self.auto_terminology_check)
+
+        self.keep_video_check = QCheckBox("쉬는 시간을 뺀 영상도 보관하기")
+        self.keep_video_check.setChecked(self.settings.keep_video)
+        self.keep_video_check.setToolTip(
+            "최대 1080p 영상을 받아 Razor에서 제외한 구간을 똑같이 제거한 "
+            "edited_lecture.mp4를 Apple 하드웨어 가속으로 저장합니다. 완료 후 원본 영상은 정리합니다."
+        )
+        options.addWidget(self.keep_video_check)
+
         self.recognition_settings_check = QCheckBox("음성 인식 세부 설정 보기")
         options.addWidget(self.recognition_settings_check)
         recognition_panel = QFrame()
@@ -433,10 +498,6 @@ class MainWindow(QMainWindow):
         ]:
             self.language_combo.addItem(label, code)
         self._select_data(self.language_combo, self.settings.language)
-        self.beam_spin = QSpinBox()
-        self.beam_spin.setRange(1, 10)
-        self.beam_spin.setValue(self.settings.beam_size)
-        self.beam_spin.setToolTip("높을수록 더 꼼꼼히 비교합니다. 처리 시간은 조금 늘어날 수 있어요.")
         self.cookie_combo = QComboBox()
         for label, value in [
             ("사용 안 함", "none"),
@@ -450,10 +511,8 @@ class MainWindow(QMainWindow):
         grid.addWidget(self.whisper_combo, 1, 0)
         grid.addWidget(self._field_label("강의 언어"), 0, 1)
         grid.addWidget(self.language_combo, 1, 1)
-        grid.addWidget(self._field_label("정확도 단계"), 2, 0)
-        grid.addWidget(self.beam_spin, 3, 0)
-        grid.addWidget(self._field_label("로그인이 필요한 영상"), 2, 1)
-        grid.addWidget(self.cookie_combo, 3, 1)
+        grid.addWidget(self._field_label("로그인이 필요한 영상"), 2, 0)
+        grid.addWidget(self.cookie_combo, 3, 0, 1, 2)
         recognition_layout.addLayout(grid)
         checks = QHBoxLayout()
         self.keep_audio_check = QCheckBox("가져온 원본 오디오도 보관하기")
@@ -628,10 +687,13 @@ class MainWindow(QMainWindow):
         self.open_notes_button.clicked.connect(self._open_last_notes)
         self.open_transcript_button = QPushButton("강의 글 열기")
         self.open_transcript_button.clicked.connect(self._open_last_transcript)
+        self.open_video_button = QPushButton("편집 영상 열기")
+        self.open_video_button.clicked.connect(self._open_last_video)
         self.open_folder_button = QPushButton("저장 폴더 열기")
         self.open_folder_button.clicked.connect(self._open_last_folder)
         result_buttons.addWidget(self.open_notes_button)
         result_buttons.addWidget(self.open_transcript_button)
+        result_buttons.addWidget(self.open_video_button)
         result_buttons.addWidget(self.open_folder_button)
         result_buttons.addStretch(1)
         result_layout.addLayout(result_buttons)
@@ -735,7 +797,7 @@ class MainWindow(QMainWindow):
 
         gpu_card, gpu_layout = self._card(
             "내 컴퓨터 확인",
-            "빠르고 정확한 음성 인식을 위해 NVIDIA 그래픽카드를 사용합니다.",
+            "빠르고 정확한 음성 인식을 위해 Apple Silicon의 MLX Metal 가속을 사용합니다.",
         )
         self.gpu_detail = QLabel("확인 중")
         self.gpu_detail.setWordWrap(True)
@@ -843,14 +905,14 @@ class MainWindow(QMainWindow):
             memory_gb = gpu.memory_mb / 1024
             self._set_badge(self.gpu_badge, f"컴퓨터 준비됨 · {memory_gb:.0f}GB", "good")
             self.gpu_detail.setText(
-                f"{gpu.name} · VRAM {memory_gb:.1f}GB · 드라이버 {gpu.driver}\n"
-                "정확도 우선 음성 인식을 사용하기에 충분합니다."
+                f"{gpu.name} · 통합 메모리 {memory_gb:.1f}GB · macOS {gpu.driver}\n"
+                "MLX Metal 음성 인식을 사용할 수 있습니다."
             )
         else:
             self._set_badge(self.gpu_badge, "컴퓨터 확인 필요", "warn")
-            self.gpu_detail.setText(f"NVIDIA 그래픽카드를 확인하지 못했습니다. {gpu.detail}")
+            self.gpu_detail.setText(f"Apple Silicon 환경을 확인하지 못했습니다. {gpu.detail}")
         codex = find_codex()
-        codex_text = str(codex) if codex else "연결 도구를 찾지 못했습니다 · install.bat을 먼저 실행해주세요."
+        codex_text = str(codex) if codex else "연결 도구를 찾지 못했습니다 · install.command를 먼저 실행해주세요."
         self.auth_detail.setText(f"연결 도구: {codex_text}\nChatGPT 로그인 상태를 확인하고 있습니다.")
 
     def _set_badge(self, label: QLabel, text: str, state: str) -> None:
@@ -883,7 +945,6 @@ class MainWindow(QMainWindow):
         self.settings.output_dir = str(output_dir.resolve())
         self.settings.whisper_model = self.whisper_combo.currentText()
         self.settings.language = str(self.language_combo.currentData())
-        self.settings.beam_size = self.beam_spin.value()
         self.settings.vad_filter = self.vad_check.isChecked()
         if self.use_time_range_check.isChecked():
             clip_start, clip_end = validate_clip_range(
@@ -895,6 +956,8 @@ class MainWindow(QMainWindow):
         self.settings.clip_start_seconds = clip_start
         self.settings.clip_end_seconds = clip_end
         self.settings.keep_audio = self.keep_audio_check.isChecked()
+        self.settings.keep_video = self.keep_video_check.isChecked()
+        self.settings.auto_terminology = self.auto_terminology_check.isChecked()
         self.settings.cookie_browser = str(self.cookie_combo.currentData())
         self.settings.codex_model = model
         self.settings.reasoning_effort = str(self.reasoning_combo.currentData())
@@ -914,6 +977,20 @@ class MainWindow(QMainWindow):
         except (OSError, ValueError) as exc:
             self._show_error(str(exc))
             return
+        if settings.auto_terminology and target_stage in {"all", "transcribe"}:
+            lecture_name, accepted = QInputDialog.getText(
+                self,
+                "전문용어 자동 입력",
+                "전사 정확도를 높일 강의명을 입력하세요.",
+                text=settings.terminology_lecture_name,
+            )
+            if not accepted:
+                return
+            lecture_name = " ".join(lecture_name.split()).strip()
+            if not lecture_name:
+                self._show_error("전문용어 자동 입력을 사용하려면 강의명을 입력해주세요.")
+                return
+            settings.terminology_lecture_name = lecture_name
         settings.last_url = url
         settings.save()
         self.log_view.clear()
@@ -959,6 +1036,8 @@ class MainWindow(QMainWindow):
     @staticmethod
     def _friendly_progress(stage: str, detail: str) -> tuple[str, str]:
         combined = f"{stage} {detail}".lower()
+        if "전문용어" in combined or "terminology" in combined:
+            return "전문용어 준비 중", "강의명에 맞는 단어를 GPT로 만들고 있어요."
         if any(word in combined for word in ("download", "다운로드", "원본")):
             return "영상 가져오는 중", "영상의 소리를 안전하게 가져오고 있어요."
         if any(word in combined for word in ("waveform", "파형", "edit", "편집")):
@@ -983,7 +1062,7 @@ class MainWindow(QMainWindow):
         self.last_result = result
         stage_labels = {
             "download": "영상을 가져왔어요. 다음에는 쉬는 시간 정리부터 이어갈 수 있습니다.",
-            "edit": "정리한 오디오를 저장했어요. 다음에는 강의 글 만들기부터 이어갈 수 있습니다.",
+            "edit": "정리한 오디오와 선택한 영상 파일을 저장했어요. 다음에는 강의 글 만들기부터 이어갈 수 있습니다.",
             "transcribe": "강의 글을 저장했어요. 다음에는 노트 정리부터 이어갈 수 있습니다.",
             "notes": "강의 노트가 모두 완성됐습니다.",
         }
@@ -993,6 +1072,7 @@ class MainWindow(QMainWindow):
         self.result_path.setText(str(result.output_dir))
         self.open_notes_button.setEnabled(result.notes_path is not None)
         self.open_transcript_button.setEnabled(result.transcript_path is not None)
+        self.open_video_button.setEnabled(result.video_path is not None)
         self.result_card.setVisible(True)
         self.stage_label.setText("모두 완료")
         self.detail_label.setText(f"100% · {stage_labels.get(result.completed_stage, '단계 저장 완료')}")
@@ -1006,6 +1086,10 @@ class MainWindow(QMainWindow):
         self._append_pipeline_log("오디오 파형이 준비됐습니다. 편집 창에서 쉬는 시간과 음악 구간을 확인해주세요.")
         dialog = AudioEditorDialog(request, self)
         self.audio_editor = dialog
+        self._notify_action_required(
+            "쉬는 시간 확인이 필요합니다",
+            "강의 파형이 준비됐습니다. 제외할 쉬는 시간과 음악 구간을 확인해주세요.",
+        )
         result = dialog.exec()
         worker = self.pipeline_worker
         exclusions = dialog.exclusions if result == QDialog.DialogCode.Accepted else None
@@ -1048,6 +1132,10 @@ class MainWindow(QMainWindow):
             self._append_pipeline_log(
                 "강의 글 만들기가 끝났습니다. 화면에서 내용을 확인한 뒤 노트를 만들어주세요."
             )
+        self._notify_action_required(
+            "강의 글 확인이 필요합니다",
+            "전사가 끝났습니다. 내용을 확인해야 다음 단계로 진행할 수 있습니다.",
+        )
 
     def _submit_transcript_review(self, approved: bool) -> None:
         if not self.pipeline_worker or not self.current_review:
@@ -1191,6 +1279,10 @@ class MainWindow(QMainWindow):
         if self.last_result and self.last_result.transcript_path:
             QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.last_result.transcript_path)))
 
+    def _open_last_video(self) -> None:
+        if self.last_result and self.last_result.video_path:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.last_result.video_path)))
+
     def _open_last_folder(self) -> None:
         if self.last_result:
             QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.last_result.output_dir)))
@@ -1221,4 +1313,6 @@ class MainWindow(QMainWindow):
                 cancel()
             thread.quit()
             thread.wait(3000)
+        if self._notification_tray:
+            self._notification_tray.hide()
         event.accept()
