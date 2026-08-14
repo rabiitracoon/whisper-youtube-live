@@ -934,7 +934,7 @@ class AudioEditorDialog(QDialog):
             QMessageBox.warning(
                 self,
                 "오디오를 재생하지 못했습니다",
-                f"macOS 재생기가 이 파일을 열지 못했습니다. 편집은 계속할 수 있습니다.\n{message}",
+                f"시스템 재생기가 이 파일을 열지 못했습니다. 편집은 계속할 수 있습니다.\n{message}",
             )
 
     def _apply(self) -> None:

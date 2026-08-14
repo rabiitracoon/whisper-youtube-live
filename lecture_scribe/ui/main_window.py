@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import platform
 from pathlib import Path
 
 from PySide6.QtCore import QSize, QThread, QTimer, QUrl, Qt
@@ -25,6 +26,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QScrollArea,
     QSizePolicy,
+    QSpinBox,
     QStackedWidget,
     QSystemTrayIcon,
     QVBoxLayout,
@@ -46,6 +48,14 @@ from .workers import AuthWorker, PipelineWorker, UpdateWorker
 
 
 ASSET_DIR = Path(__file__).resolve().parent / "assets"
+IS_WINDOWS = platform.system() == "Windows"
+INSTALLER_NAME = "install.bat" if IS_WINDOWS else "install.command"
+ACCELERATOR_DESCRIPTION = (
+    "빠르고 정확한 음성 인식을 위해 NVIDIA CUDA 가속을 사용합니다."
+    if IS_WINDOWS
+    else "빠르고 정확한 음성 인식을 위해 Apple Silicon의 MLX Metal 가속을 사용합니다."
+)
+VIDEO_ENCODER_NAME = "NVIDIA NVENC" if IS_WINDOWS else "Apple VideoToolbox"
 
 
 class MainWindow(QMainWindow):
@@ -463,7 +473,7 @@ class MainWindow(QMainWindow):
         self.auto_terminology_check.setChecked(self.settings.auto_terminology)
         self.auto_terminology_check.setToolTip(
             "시작할 때 강의명을 입력하면 연결된 GPT가 관련 전문용어를 만들고 "
-            "MLX Whisper 전사 문맥에 자동 적용합니다."
+            "Whisper 전사 문맥에 자동 적용합니다."
         )
         options.addWidget(self.auto_terminology_check)
 
@@ -471,7 +481,8 @@ class MainWindow(QMainWindow):
         self.keep_video_check.setChecked(self.settings.keep_video)
         self.keep_video_check.setToolTip(
             "최대 1080p 영상을 받아 Razor에서 제외한 구간을 똑같이 제거한 "
-            "edited_lecture.mp4를 Apple 하드웨어 가속으로 저장합니다. 완료 후 원본 영상은 정리합니다."
+            f"edited_lecture.mp4를 {VIDEO_ENCODER_NAME} 하드웨어 가속으로 저장합니다. "
+            "완료 후 원본 영상은 정리합니다."
         )
         options.addWidget(self.keep_video_check)
 
@@ -498,6 +509,10 @@ class MainWindow(QMainWindow):
         ]:
             self.language_combo.addItem(label, code)
         self._select_data(self.language_combo, self.settings.language)
+        self.beam_spin = QSpinBox()
+        self.beam_spin.setRange(1, 10)
+        self.beam_spin.setValue(self.settings.beam_size)
+        self.beam_spin.setToolTip("Windows CUDA 전사에서 높을수록 더 꼼꼼히 비교합니다.")
         self.cookie_combo = QComboBox()
         for label, value in [
             ("사용 안 함", "none"),
@@ -511,8 +526,14 @@ class MainWindow(QMainWindow):
         grid.addWidget(self.whisper_combo, 1, 0)
         grid.addWidget(self._field_label("강의 언어"), 0, 1)
         grid.addWidget(self.language_combo, 1, 1)
-        grid.addWidget(self._field_label("로그인이 필요한 영상"), 2, 0)
-        grid.addWidget(self.cookie_combo, 3, 0, 1, 2)
+        if IS_WINDOWS:
+            grid.addWidget(self._field_label("정확도 단계"), 2, 0)
+            grid.addWidget(self.beam_spin, 3, 0)
+            grid.addWidget(self._field_label("로그인이 필요한 영상"), 2, 1)
+            grid.addWidget(self.cookie_combo, 3, 1)
+        else:
+            grid.addWidget(self._field_label("로그인이 필요한 영상"), 2, 0)
+            grid.addWidget(self.cookie_combo, 3, 0, 1, 2)
         recognition_layout.addLayout(grid)
         checks = QHBoxLayout()
         self.keep_audio_check = QCheckBox("가져온 원본 오디오도 보관하기")
@@ -797,7 +818,7 @@ class MainWindow(QMainWindow):
 
         gpu_card, gpu_layout = self._card(
             "내 컴퓨터 확인",
-            "빠르고 정확한 음성 인식을 위해 Apple Silicon의 MLX Metal 가속을 사용합니다.",
+            ACCELERATOR_DESCRIPTION,
         )
         self.gpu_detail = QLabel("확인 중")
         self.gpu_detail.setWordWrap(True)
@@ -904,15 +925,26 @@ class MainWindow(QMainWindow):
         if gpu.available:
             memory_gb = gpu.memory_mb / 1024
             self._set_badge(self.gpu_badge, f"컴퓨터 준비됨 · {memory_gb:.0f}GB", "good")
-            self.gpu_detail.setText(
-                f"{gpu.name} · 통합 메모리 {memory_gb:.1f}GB · macOS {gpu.driver}\n"
-                "MLX Metal 음성 인식을 사용할 수 있습니다."
-            )
+            if IS_WINDOWS:
+                detail = (
+                    f"{gpu.name} · VRAM {memory_gb:.1f}GB · 드라이버 {gpu.driver}\n"
+                    "CUDA 음성 인식을 사용할 수 있습니다."
+                )
+            else:
+                detail = (
+                    f"{gpu.name} · 통합 메모리 {memory_gb:.1f}GB · macOS {gpu.driver}\n"
+                    "MLX Metal 음성 인식을 사용할 수 있습니다."
+                )
+            self.gpu_detail.setText(detail)
         else:
             self._set_badge(self.gpu_badge, "컴퓨터 확인 필요", "warn")
-            self.gpu_detail.setText(f"Apple Silicon 환경을 확인하지 못했습니다. {gpu.detail}")
+            self.gpu_detail.setText(f"GPU 가속 환경을 확인하지 못했습니다. {gpu.detail}")
         codex = find_codex()
-        codex_text = str(codex) if codex else "연결 도구를 찾지 못했습니다 · install.command를 먼저 실행해주세요."
+        codex_text = (
+            str(codex)
+            if codex
+            else f"연결 도구를 찾지 못했습니다 · {INSTALLER_NAME}을 먼저 실행해주세요."
+        )
         self.auth_detail.setText(f"연결 도구: {codex_text}\nChatGPT 로그인 상태를 확인하고 있습니다.")
 
     def _set_badge(self, label: QLabel, text: str, state: str) -> None:
@@ -958,6 +990,7 @@ class MainWindow(QMainWindow):
         self.settings.keep_audio = self.keep_audio_check.isChecked()
         self.settings.keep_video = self.keep_video_check.isChecked()
         self.settings.auto_terminology = self.auto_terminology_check.isChecked()
+        self.settings.beam_size = self.beam_spin.value()
         self.settings.cookie_browser = str(self.cookie_combo.currentData())
         self.settings.codex_model = model
         self.settings.reasoning_effort = str(self.reasoning_combo.currentData())

@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import os
 import platform
+import site
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Event
-from typing import Callable
+from typing import Callable, Iterable
 
 from .audio_edit import map_edited_time_to_original
 from .paths import PROJECT_ROOT
@@ -23,6 +26,8 @@ LOCAL_MLX_MODELS = {
     "large-v2": PROJECT_ROOT / "models" / "whisper-large-v2-mlx",
     "medium": PROJECT_ROOT / "models" / "whisper-medium-mlx",
 }
+_DLL_HANDLES: list[object] = []
+_CUDA_MODEL_CACHE: dict[tuple[str, str], object] = {}
 
 
 class TranscriptionCancelled(RuntimeError):
@@ -52,8 +57,27 @@ class TranscriptResult:
     clip_ranges: tuple[tuple[float, float], ...]
 
 
+def runtime_backend() -> str:
+    if platform.system() == "Windows":
+        return "cuda"
+    if platform.system() == "Darwin" and platform.machine() == "arm64":
+        return "mlx"
+    return "unsupported"
+
+
+def verify_accelerator() -> str:
+    backend = runtime_backend()
+    if backend == "cuda":
+        return verify_cuda()
+    if backend == "mlx":
+        return verify_mlx()
+    raise RuntimeError(
+        "지원하는 전사 환경이 아닙니다. Windows에서는 NVIDIA CUDA GPU가, "
+        "macOS에서는 Apple Silicon이 필요합니다."
+    )
+
+
 def resolve_mlx_model(model_name: str) -> str:
-    """Accept the old UI aliases as well as an MLX Hugging Face repo/local path."""
     local_path = LOCAL_MLX_MODELS.get(model_name)
     if local_path and (local_path / "config.json").is_file() and (
         (local_path / "weights.npz").is_file()
@@ -64,12 +88,11 @@ def resolve_mlx_model(model_name: str) -> str:
 
 
 def verify_mlx() -> str:
-    if platform.system() != "Darwin" or platform.machine() != "arm64":
+    if runtime_backend() != "mlx":
         raise RuntimeError("MLX 전사는 Apple Silicon(arm64) Mac에서만 사용할 수 있습니다.")
     try:
         import mlx.core as mx
 
-        # Force Metal initialization here so failures are reported before downloading audio.
         mx.eval(mx.zeros((1,)))
     except (ImportError, RuntimeError) as exc:
         raise RuntimeError(
@@ -79,8 +102,74 @@ def verify_mlx() -> str:
     return "Apple Silicon · MLX Metal"
 
 
+def _add_dll_directory(path: Path) -> None:
+    if not path.exists():
+        return
+    path_text = str(path.resolve())
+    current = os.environ.get("PATH", "")
+    if path_text.lower() not in current.lower().split(os.pathsep):
+        os.environ["PATH"] = path_text + os.pathsep + current
+    if hasattr(os, "add_dll_directory"):
+        try:
+            _DLL_HANDLES.append(os.add_dll_directory(path_text))
+        except OSError:
+            pass
+
+
+def prepare_cuda_runtime() -> None:
+    roots = {Path(item) for item in site.getsitepackages() if item}
+    roots.add(Path(sys.prefix) / "Lib" / "site-packages")
+    for root in roots:
+        _add_dll_directory(root / "torch" / "lib")
+        nvidia_root = root / "nvidia"
+        if nvidia_root.exists():
+            for bin_dir in nvidia_root.glob("*/bin"):
+                _add_dll_directory(bin_dir)
+    for env_name in ("CUDA_PATH", "CUDA_PATH_V12_8", "CUDA_PATH_V12_6"):
+        value = os.environ.get(env_name)
+        if value:
+            _add_dll_directory(Path(value) / "bin")
+    try:
+        import torch
+
+        if not torch.cuda.is_available():
+            raise RuntimeError("PyTorch가 NVIDIA GPU를 인식하지 못했습니다.")
+        torch.empty(1, device="cuda")
+    except ImportError as exc:
+        raise RuntimeError(
+            "GPU용 PyTorch가 설치되지 않았습니다. install.bat을 다시 실행해주세요."
+        ) from exc
+
+
+def verify_cuda() -> str:
+    if platform.system() != "Windows":
+        raise RuntimeError("CUDA 전사는 NVIDIA GPU가 있는 Windows에서만 지원합니다.")
+    prepare_cuda_runtime()
+    import ctranslate2
+    import torch
+
+    if ctranslate2.get_cuda_device_count() < 1:
+        raise RuntimeError("CTranslate2가 사용할 수 있는 NVIDIA CUDA 장치를 찾지 못했습니다.")
+    return str(torch.cuda.get_device_name(0))
+
+
+def _get_cuda_model(model_name: str, compute_type: str, log: LogCallback | None):
+    key = (model_name, compute_type)
+    if key in _CUDA_MODEL_CACHE:
+        if log:
+            log(f"메모리에 로드된 Whisper {model_name} 모델을 재사용합니다.")
+        return _CUDA_MODEL_CACHE[key]
+    prepare_cuda_runtime()
+    from faster_whisper import WhisperModel
+
+    if log:
+        log(f"Whisper {model_name} 모델을 불러옵니다. 첫 실행은 모델 다운로드가 필요합니다.")
+    model = WhisperModel(model_name, device="cuda", compute_type=compute_type, num_workers=1)
+    _CUDA_MODEL_CACHE[key] = model
+    return model
+
+
 def _audio_duration(path: Path) -> float:
-    """Read the actual edited file duration without decoding it a second time."""
     try:
         import av
 
@@ -113,9 +202,12 @@ def transcribe_audio(
     log: LogCallback | None = None,
     cancel_event: Event | None = None,
 ) -> TranscriptResult:
-    model_repo = resolve_mlx_model(model_name)
+    backend = runtime_backend()
+    if backend == "unsupported":
+        verify_accelerator()
     if cancel_event and cancel_event.is_set():
         raise TranscriptionCancelled("사용자가 전사를 취소했습니다.")
+
     requested_end = float(clip_end) if clip_end is not None else None
     effective_end = requested_end or float(video.duration or 0)
     if effective_end > 0 and effective_end <= clip_start:
@@ -136,43 +228,30 @@ def transcribe_audio(
         effective_end = normalized_ranges[-1][1]
     elif has_explicit_clip:
         clip_timestamps = [clip_start] if clip_end is None else [clip_start, clip_end]
-    if log:
-        if timestamp_map:
-            range_text = "저장된 연속 편집본 전체"
-        else:
-            end_text = format_duration(effective_end) if effective_end > 0 else "영상 끝"
-            range_text = f"{format_duration(clip_start)}~{end_text}"
-        if not timestamp_map and len(normalized_ranges) > 1:
-            range_text = f"{len(normalized_ranges)}개 강의 구간"
-        log(f"정확도 우선 FP16 설정으로 MLX Metal 전사를 시작합니다. 구간: {range_text}")
-        log(f"MLX 모델: {model_repo} (첫 실행에는 모델 다운로드가 필요합니다.)")
-        if timestamp_map:
-            log("반복 억제를 적용하며, 결과 시간은 원본 영상 위치로 다시 연결합니다.")
-        if vad_filter:
-            log("쉬는 시간 편집 단계의 Silero VAD 결과를 사용하고 Whisper 반복 억제를 적용합니다.")
-        if prompt_terms:
-            log(f"전문용어 {len(prompt_terms)}개를 Whisper 문맥에 자동 적용합니다.")
-    import mlx_whisper
 
+    if timestamp_map:
+        range_text = "저장된 연속 편집본 전체"
+    else:
+        end_text = format_duration(effective_end) if effective_end > 0 else "영상 끝"
+        range_text = f"{format_duration(clip_start)}~{end_text}"
+    if not timestamp_map and len(normalized_ranges) > 1:
+        range_text = f"{len(normalized_ranges)}개 강의 구간"
     initial_prompt = _build_initial_prompt(prompt_terms)
 
-    result = mlx_whisper.transcribe(
-        str(audio_path),
-        path_or_hf_repo=model_repo,
-        task="transcribe",
-        language=None if language == "auto" else language,
-        temperature=0.0,
-        condition_on_previous_text=False,
-        initial_prompt=initial_prompt,
-        clip_timestamps=clip_timestamps,
-        word_timestamps=False,
-        fp16=compute_type != "float32",
-        verbose=None,
-    )
-    raw_segments = result.get("segments", [])
-    full_duration = _audio_duration(audio_path) or max(
-        (float(item.get("end", 0)) for item in raw_segments), default=float(video.duration or 1)
-    )
+    if backend == "mlx":
+        raw_segments, full_duration, detected_language, probability = _transcribe_mlx(
+            audio_path, video, model_name, language, compute_type, clip_timestamps,
+            initial_prompt, range_text, timestamp_map, vad_filter, log,
+        )
+    else:
+        raw_segments, full_duration, detected_language, probability = _transcribe_cuda(
+            audio_path, video, model_name, language, compute_type, beam_size,
+            clip_timestamps, initial_prompt, range_text, timestamp_map, vad_filter,
+            has_explicit_clip, log,
+        )
+    if log and prompt_terms:
+        log(f"전문용어 {len(prompt_terms)}개를 Whisper 문맥에 자동 적용합니다.")
+
     if timestamp_map:
         clip_start = timestamp_map[0][0]
         effective_end = timestamp_map[-1][1]
@@ -191,14 +270,15 @@ def transcribe_audio(
         )
         result_ranges = normalized_ranges
     selected_duration = max(1.0, sum(end - start for start, end in normalized_ranges))
+
     segments: list[TranscriptSegment] = []
     for raw in raw_segments:
         if cancel_event and cancel_event.is_set():
             raise TranscriptionCancelled("사용자가 전사를 취소했습니다.")
-        text = str(raw.get("text", "")).strip()
+        text = str(_raw_value(raw, "text", "")).strip()
+        raw_start = float(_raw_value(raw, "start", 0))
+        raw_end = float(_raw_value(raw, "end", raw_start))
         if text:
-            raw_start = float(raw.get("start", 0))
-            raw_end = float(raw.get("end", raw_start))
             segment_start = raw_start
             segment_end = raw_end
             if timestamp_map:
@@ -216,10 +296,9 @@ def transcribe_audio(
             )
         if progress:
             completed = sum(
-                max(0.0, min(float(raw.get("end", 0)), end) - start)
-                for start, end in normalized_ranges
+                max(0.0, min(raw_end, end) - start) for start, end in normalized_ranges
             )
-            progress(min(1.0, completed / selected_duration), f"전사 중 · {format_duration(float(raw.get('end', 0)))}")
+            progress(min(1.0, completed / selected_duration), f"전사 중 · {format_duration(raw_end)}")
 
     if not segments:
         raise RuntimeError("음성을 감지하지 못해 전사 결과가 비어 있습니다.")
@@ -230,27 +309,80 @@ def transcribe_audio(
     text_path.write_text("\n".join(item.text for item in segments) + "\n", encoding="utf-8")
     markdown_path.write_text(_to_markdown(video, segments), encoding="utf-8")
     srt_path.write_text(_to_srt(segments), encoding="utf-8")
-    detected_language = str(result.get("language", language))
-    # mlx-whisper returns the selected language but not its probability. Avoid a
-    # false low-confidence warning in the downstream review.
-    probability = 1.0
     if progress:
         progress(1.0, "전사 파일 저장 완료")
     return TranscriptResult(
-        text_path=text_path,
-        markdown_path=markdown_path,
-        srt_path=srt_path,
-        language=detected_language,
-        language_probability=probability,
-        segments=tuple(segments),
-        clip_start=clip_start,
-        clip_end=result_ranges[-1][1],
-        clip_ranges=result_ranges,
+        text_path=text_path, markdown_path=markdown_path, srt_path=srt_path,
+        language=detected_language, language_probability=probability,
+        segments=tuple(segments), clip_start=clip_start,
+        clip_end=result_ranges[-1][1], clip_ranges=result_ranges,
+    )
+
+
+def _transcribe_mlx(
+    audio_path: Path, video: VideoInfo, model_name: str, language: str,
+    compute_type: str, clip_timestamps: str | list[float],
+    initial_prompt: str | None, range_text: str,
+    timestamp_map: tuple[tuple[float, float], ...], vad_filter: bool,
+    log: LogCallback | None,
+) -> tuple[Iterable[object], float, str, float]:
+    import mlx_whisper
+
+    model_repo = resolve_mlx_model(model_name)
+    if log:
+        log(f"정확도 우선 FP16 설정으로 MLX Metal 전사를 시작합니다. 구간: {range_text}")
+        log(f"MLX 모델: {model_repo} (첫 실행에는 모델 다운로드가 필요합니다.)")
+        if timestamp_map:
+            log("반복 억제를 적용하며, 결과 시간은 원본 영상 위치로 다시 연결합니다.")
+        if vad_filter:
+            log("쉬는 시간 편집 단계의 Silero VAD 결과를 사용하고 Whisper 반복 억제를 적용합니다.")
+    result = mlx_whisper.transcribe(
+        str(audio_path), path_or_hf_repo=model_repo, task="transcribe",
+        language=None if language == "auto" else language, temperature=0.0,
+        condition_on_previous_text=False, initial_prompt=initial_prompt,
+        clip_timestamps=clip_timestamps, word_timestamps=False,
+        fp16=compute_type != "float32", verbose=None,
+    )
+    raw_segments = result.get("segments", [])
+    duration = _audio_duration(audio_path) or max(
+        (float(item.get("end", 0)) for item in raw_segments),
+        default=float(video.duration or 1),
+    )
+    return raw_segments, duration, str(result.get("language", language)), 1.0
+
+
+def _transcribe_cuda(
+    audio_path: Path, video: VideoInfo, model_name: str, language: str,
+    compute_type: str, beam_size: int, clip_timestamps: str | list[float],
+    initial_prompt: str | None, range_text: str,
+    timestamp_map: tuple[tuple[float, float], ...], vad_filter: bool,
+    has_explicit_clip: bool, log: LogCallback | None,
+) -> tuple[Iterable[object], float, str, float]:
+    model = _get_cuda_model(model_name, compute_type, log)
+    effective_vad = vad_filter and not has_explicit_clip
+    if log:
+        log(f"정확도 우선 설정(beam={beam_size}, FP16)으로 CUDA 전사를 시작합니다. 구간: {range_text}")
+        if timestamp_map:
+            log("VAD와 반복 억제를 적용하며, 결과 시간은 원본 영상 위치로 다시 연결합니다.")
+        if vad_filter and has_explicit_clip:
+            log("선택 구간 전사에서는 Whisper 구간 지정이 VAD보다 우선 적용됩니다.")
+    raw_segments, info = model.transcribe(
+        str(audio_path), task="transcribe",
+        language=None if language == "auto" else language,
+        beam_size=beam_size, best_of=max(beam_size, 5), temperature=0.0,
+        condition_on_previous_text=False, initial_prompt=initial_prompt,
+        vad_filter=effective_vad,
+        vad_parameters={"min_silence_duration_ms": 500} if effective_vad else None,
+        clip_timestamps=clip_timestamps, word_timestamps=False,
+    )
+    return (
+        raw_segments, float(getattr(info, "duration", 0) or video.duration or 1),
+        str(getattr(info, "language", language)),
+        float(getattr(info, "language_probability", 0.0) or 0.0),
     )
 
 
 def _build_initial_prompt(prompt_terms: tuple[str, ...], limit: int = 600) -> str | None:
-    """Build a compact Whisper prompt without overflowing its short text context."""
     selected: list[str] = []
     seen: set[str] = set()
     current_length = 0
@@ -270,21 +402,22 @@ def _build_initial_prompt(prompt_terms: tuple[str, ...], limit: int = 600) -> st
     return "이 강의의 주요 전문용어: " + ", ".join(selected)
 
 
+def _raw_value(value: object, attribute: str, default: object = None) -> object:
+    if isinstance(value, dict):
+        return value.get(attribute, default)
+    return getattr(value, attribute, default)
+
+
 def _optional_float(value: object, attribute: str) -> float | None:
-    raw = value.get(attribute) if isinstance(value, dict) else getattr(value, attribute, None)
+    raw = _raw_value(value, attribute)
     return float(raw) if raw is not None else None
 
 
 def _to_markdown(video: VideoInfo, segments: list[TranscriptSegment]) -> str:
     lines = [
-        f"# {video.title} — 전사문",
-        "",
-        f"- 채널: {video.channel}",
-        f"- 원본: {video.webpage_url}",
-        f"- 길이: {format_duration(video.duration)}",
-        "",
-        "## 타임스탬프 전사",
-        "",
+        f"# {video.title} — 전사문", "", f"- 채널: {video.channel}",
+        f"- 원본: {video.webpage_url}", f"- 길이: {format_duration(video.duration)}",
+        "", "## 타임스탬프 전사", "",
     ]
     for item in segments:
         seconds = int(item.start)
@@ -294,12 +427,10 @@ def _to_markdown(video: VideoInfo, segments: list[TranscriptSegment]) -> str:
 
 
 def _to_srt(segments: list[TranscriptSegment]) -> str:
-    blocks = []
-    for index, item in enumerate(segments, start=1):
-        blocks.append(
-            f"{index}\n{_srt_time(item.start)} --> {_srt_time(item.end)}\n{item.text}\n"
-        )
-    return "\n".join(blocks)
+    return "\n".join(
+        f"{index}\n{_srt_time(item.start)} --> {_srt_time(item.end)}\n{item.text}\n"
+        for index, item in enumerate(segments, start=1)
+    )
 
 
 def _srt_time(seconds: float) -> str:

@@ -1,106 +1,94 @@
-# Lecture Scribe for Apple Silicon
+# Lecture Scribe
 
-YouTube 강의를 내려받아 Apple Silicon의 **MLX Metal GPU**로 로컬 전사하고, 선택적으로 ChatGPT Plus의 Codex OAuth 세션으로 학습용 Markdown 노트를 만드는 macOS 앱입니다. NVIDIA GPU, CUDA, OpenAI API 키는 필요하지 않습니다.
-
-이 저장소는 [rabiitracoon/whisper-youtube-live](https://github.com/rabiitracoon/whisper-youtube-live)의 Windows/NVIDIA 버전을 Mac MLX 환경에 맞게 변환한 버전입니다.
+YouTube 강의를 내려받아 GPU로 로컬 전사하고, 선택적으로 ChatGPT의 Codex OAuth 세션으로 학습용 Markdown 노트를 만드는 데스크톱 앱입니다. 하나의 코드베이스가 실행 환경을 감지해 Windows에서는 NVIDIA CUDA, Apple Silicon Mac에서는 MLX Metal을 사용합니다.
 
 ## 지원 환경
 
-- Apple Silicon Mac(M1/M2/M3/M4 계열, `arm64`)
-- macOS 13 이상 권장
-- Python 3.11 또는 3.12
-- 인터넷 연결: YouTube 다운로드와 최초 Whisper 모델 다운로드 시 필요
-- Node.js: AI 노트 기능을 사용할 때만 필요
+| 운영체제 | 음성 전사 | 편집 영상 인코딩 | 실행 파일 |
+|---|---|---|---|
+| Windows 10/11 + NVIDIA GPU | `faster-whisper` + CUDA FP16 | NVIDIA NVENC | `install.bat`, `run.bat` |
+| Apple Silicon macOS | `mlx-whisper` + MLX Metal | Apple VideoToolbox | `install.command`, `run.command` |
 
-Intel Mac에서는 MLX를 사용할 수 없습니다.
+Intel Mac, Linux, NVIDIA GPU가 없는 Windows는 현재 GPU 전사를 지원하지 않습니다.
 
-## 설치
+## 주요 기능
 
-Finder에서 [`install.command`](./install.command)를 더블클릭합니다. macOS가 처음 실행을 막으면 파일을 우클릭하고 **열기**를 선택하세요.
+- YouTube 링크로 영상 가져오기 → 쉬는 시간 정리 → 전사 확인 → 학습 노트 생성
+- 시작·종료 시간 지정과 파형 기반 Razor 편집
+- Silero VAD를 이용한 긴 비음성 구간 자동 감지
+- 쉬는 시간을 동일하게 제거한 H.264/AAC `edited_lecture.mp4` 선택 저장
+- Windows NVIDIA NVENC 및 macOS Apple VideoToolbox 하드웨어 전용 인코딩
+- `checkpoint.json`을 이용한 다운로드·편집·전사·노트 단계 재개
+- 강의명 기반 GPT 전문용어 생성 및 Whisper `initial_prompt` 자동 적용
+- `transcript.txt`, `transcript.md`, `transcript.srt`, `lecture_notes.md` 저장
+- ChatGPT OAuth 사용, OpenAI API 키와 API 종량제 호출 없음
 
-터미널에서는 다음처럼 실행할 수 있습니다.
+## 설치 및 실행
+
+### Windows + NVIDIA
+
+1. [`install.bat`](./install.bat)을 실행합니다.
+2. 설치가 끝나면 [`run.bat`](./run.bat)을 실행합니다.
+
+설치기는 Python 가상환경, CUDA 12.8 PyTorch와 앱 의존성을 준비합니다. Node.js가 설치되어 있으면 Codex CLI도 함께 준비합니다. NVIDIA 드라이버가 최신 상태인지 확인하세요.
+
+### Apple Silicon Mac
+
+1. Finder에서 [`install.command`](./install.command)를 더블클릭합니다.
+2. macOS가 실행을 막으면 파일을 우클릭하고 **열기**를 선택합니다.
+3. 설치가 끝나면 [`run.command`](./run.command)를 실행합니다.
+
+터미널에서는 다음과 같이 실행할 수 있습니다.
 
 ```bash
 ./install.command
+./run.command
 ```
 
-설치기는 프로젝트 전용 `.venv`를 만들고 다음 항목을 설치합니다.
-
-- `mlx-whisper`: Apple Silicon Metal 기반 Whisper 전사
-- `PySide6`: 데스크톱 UI
-- `yt-dlp`: YouTube 오디오 다운로드
-- `imageio-ffmpeg`: 쉬는 시간을 제거한 영상의 Apple 하드웨어 인코딩
-- `faster-whisper`의 Silero VAD: 쉬는 시간 자동 감지에만 CPU로 사용
-- `@openai/codex`: AI 노트 기능(Node.js가 있을 때)
-
-Python이 없다면 Homebrew 설치 후 아래 명령을 먼저 실행하세요.
+Python이 없다면 먼저 설치합니다.
 
 ```bash
 brew install python@3.12
 ```
 
-AI 노트 기능까지 사용할 경우 Node.js도 설치합니다.
+AI 노트나 전문용어 자동 입력을 사용할 경우 Node.js도 필요합니다.
 
 ```bash
 brew install node
 ```
 
-## 실행
-
-Finder에서 [`run.command`](./run.command)를 더블클릭하거나 터미널에서 실행합니다.
-
-```bash
-./run.command
-```
-
-가상환경이 없으면 실행 스크립트가 설치를 먼저 시작합니다.
-
 ## 사용 순서
 
-1. **새 강의 노트**에서 단일 YouTube 영상 URL을 입력합니다.
-2. 필요하면 언어, Whisper 모델, 영상 시작·종료 구간을 지정합니다. 전문용어 보정이 필요하면 **전문용어 자동 입력**을 켭니다.
-3. 전문용어 자동 입력을 켰다면 시작할 때 강의명을 입력합니다. 연결된 GPT가 관련 용어를 만들고 Whisper 전사에 자동 적용합니다.
-4. 영상을 가져온 뒤 파형 편집기에서 쉬는 시간을 자동으로 찾거나 직접 제외합니다.
-5. `edited_lecture.flac`가 만들어지면 MLX Whisper가 로컬에서 전사합니다. 영상 보관 옵션을 켰다면 같은 구간으로 `edited_lecture.mp4`도 만듭니다.
-6. 전사 내용을 확인합니다.
-7. ChatGPT 연결을 한 경우 **확인했어요 · 노트 만들기**로 Markdown 노트를 생성합니다.
+1. **새 강의 노트**에서 단일 YouTube URL을 입력합니다.
+2. 필요하면 강의 구간, 언어, Whisper 모델을 설정합니다.
+3. 전문용어 보정이 필요하면 **전문용어 자동 입력**을 켭니다.
+4. 시작할 때 강의명을 입력하면 연결된 GPT가 관련 용어를 생성합니다.
+5. 파형 편집기에서 쉬는 시간을 자동으로 찾거나 직접 제외합니다.
+6. 운영체제에 맞는 GPU 백엔드가 편집본을 전사합니다.
+7. 전사 결과를 확인한 뒤 Markdown 노트를 만듭니다.
 
-전문용어 자동 입력을 끄고 전사만 사용할 때는 Node.js, Codex 로그인, ChatGPT 구독이 필요하지 않습니다. 전문용어 자동 입력에는 도구 탭에서 연결한 ChatGPT 로그인이 필요합니다.
+전문용어 자동 입력을 끄고 전사만 사용할 때는 Codex 로그인과 ChatGPT 구독이 필요하지 않습니다. 전문용어 자동 입력에는 앱의 **연결과 업데이트** 화면에서 연결한 ChatGPT 로그인이 필요합니다.
 
-## MLX 모델
+GPT에는 강의명과 YouTube 영상 제목이 전달됩니다. 음성과 Whisper 전사는 컴퓨터에서 로컬로 처리됩니다. 노트 생성 단계에서는 사용자가 확인한 전사문이 Codex에 전달됩니다.
 
-UI의 기존 모델 이름은 아래 MLX 모델로 자동 연결됩니다.
+## Whisper 모델
 
-| UI 표시 | 실제 MLX 모델 |
-|---|---|
-| `large-v3` | `mlx-community/whisper-large-v3-mlx` |
-| `large-v2` | `mlx-community/whisper-large-v2-mlx` |
-| `medium` | `mlx-community/whisper-medium-mlx` |
+UI에서는 두 운영체제 모두 `large-v3`, `large-v2`, `medium` 이름을 사용합니다.
 
-기본값은 정확도 우선 `large-v3`입니다. 모델은 처음 전사할 때 Hugging Face에서 내려받고 이후 로컬 캐시를 재사용합니다. 8GB 메모리 Mac에서 메모리 부족이 발생하면 `medium`을 사용하거나 다른 앱을 종료하세요.
+- Windows: `faster-whisper`가 모델을 내려받아 CUDA로 실행합니다.
+- macOS: 동일한 이름을 `mlx-community/whisper-*-mlx` 모델로 자동 변환합니다.
 
-이미 받은 `large-v3` MLX 모델이 있다면 모델 폴더의 내용(`config.json`, `weights.npz` 또는 `weights.safetensors` 등)을 `models/whisper-large-v3-mlx/`에 복사하세요. 앱은 완전한 로컬 모델을 발견하면 Hugging Face 다운로드보다 우선 사용합니다.
+이미 받은 macOS `large-v3` MLX 모델이 있다면 모델 폴더 내용을 `models/whisper-large-v3-mlx/`에 복사하세요. `config.json`과 `weights.npz` 또는 `weights.safetensors`가 있으면 원격 다운로드보다 우선 사용합니다. 실제 모델 파일은 Git에 포함되지 않습니다.
 
-## 주요 기능
+## 전문용어 자동 입력
 
-- YouTube 오디오 다운로드와 로그인 브라우저 쿠키 지원
-- 선택 시 최대 1080p 원본에서 쉬는 시간을 제거한 H.264/AAC MP4 저장
-- Apple VideoToolbox 하드웨어 영상 인코딩(CPU 인코더로 자동 대체하지 않음)
-- 시작·종료 시간 지정
-- 파형 기반 쉬는 시간 제거와 자동 비음성 구간 감지
-- 중단 후 `checkpoint.json` 단계별 재개
-- MLX Whisper 전사 결과 자동 점검
-- 강의명 기반 GPT 전문용어 생성 및 Whisper `initial_prompt` 자동 적용
-- `transcript.txt`, `transcript.md`, `transcript.srt` 저장
-- 선택적인 Codex OAuth 기반 `lecture_notes.md` 생성
-- OpenAI API 키 및 API 종량제 호출 없음
-- 쉬는 시간 편집과 전사 확인이 필요할 때 macOS 알림
+생성된 단어는 각 작업 폴더의 `transcription_terms.txt`에 저장되고 Whisper 초기 문맥에 적용됩니다. 같은 강의명으로 다시 실행하면 저장된 목록을 재사용해 GPT를 중복 호출하지 않습니다.
 
 ## 출력 구조
 
 ```text
 outputs/
-└── 20260720_101530_VIDEOID_영상 제목/
+└── 작업 폴더/
     ├── metadata.json
     ├── checkpoint.json
     ├── edited_lecture.flac
@@ -113,46 +101,31 @@ outputs/
     └── lecture_notes.md
 ```
 
-영상 보관 옵션을 사용하면 원본 영상은 전체 작업 완료 후 정리되고 `edited_lecture.mp4`만 보존됩니다. 영상 인코딩에는 Apple VideoToolbox 하드웨어 가속을 사용합니다.
+영상 보관 옵션을 사용하면 원본 영상은 전체 작업 완료 후 정리되고 편집본만 보존됩니다. 하드웨어 영상 인코더를 사용할 수 없을 때는 느린 CPU 인코딩으로 자동 대체하지 않고 오류를 표시합니다.
 
-## ChatGPT 연결
-
-AI 노트를 만들려면 앱의 **연결과 업데이트** 화면에서 **ChatGPT 연결하기**를 누르고 브라우저 로그인을 완료합니다. 앱은 OAuth 토큰을 직접 읽거나 저장하지 않고 공식 Codex CLI의 로그인 상태를 사용합니다.
-
-전사 과정은 전부 Mac 안에서 처리됩니다. AI 노트 생성 단계에서만 확인한 전사문이 Codex에 전달됩니다.
-
-## 점검과 테스트
+## 개발 및 테스트
 
 ```bash
-.venv/bin/python scripts/verify_install.py
-.venv/bin/python -m unittest discover -s tests -v
-.venv/bin/python -m compileall -q app.py lecture_scribe tests scripts
+python -m unittest discover -s tests -v
+python scripts/verify_install.py
 ```
 
-샌드박스나 원격 세션에서는 `No Metal device available`이 발생할 수 있습니다. Finder나 일반 Terminal.app에서 실행하세요.
+`verify_install.py`는 현재 운영체제를 감지해 CUDA/NVENC 또는 MLX/VideoToolbox를 검사합니다.
 
 ## 문제 해결
 
-### `MLX cannot access Metal`
+### NVIDIA CUDA 또는 NVENC를 찾지 못함
 
-Apple Silicon Mac인지 확인하고 일반 macOS 로그인 세션의 Terminal.app 또는 Finder에서 실행하세요. SSH, 가상 머신, 일부 샌드박스 환경에서는 Metal 장치에 접근할 수 없습니다.
+NVIDIA 드라이버를 업데이트하고 Windows를 재부팅한 뒤 `install.bat`을 다시 실행하세요.
 
-### 첫 전사가 오래 걸림
+### MLX 또는 VideoToolbox를 찾지 못함
 
-`large-v3` 모델을 최초 한 번 다운로드하고 메모리에 올리는 시간입니다. 다음 전사부터 캐시를 재사용합니다.
+Apple Silicon Mac인지 확인하고 Finder 또는 일반 Terminal.app에서 실행하세요. SSH, 가상 머신, 일부 샌드박스에서는 Metal 장치에 접근할 수 없습니다.
 
-### YouTube가 로그인을 요구함
+### Codex CLI가 없음
 
-앱 설정에서 현재 로그인된 Chrome/Edge/Firefox 쿠키를 선택하세요. 본인에게 시청 및 변환 권한이 있는 영상에만 사용하세요.
+현재 운영체제의 설치 파일을 다시 실행하세요. 전사만 사용할 경우에는 전문용어 자동 입력을 끄면 Codex 없이 사용할 수 있습니다.
 
-### Codex CLI가 없다고 표시됨
+### YouTube 다운로드 오류
 
-`brew install node` 실행 후 `./install.command`를 다시 실행하세요. 전사 기능에는 영향이 없습니다.
-
-## 이용 시 주의
-
-본인이 시청·다운로드·변환할 권한이 있는 영상에만 사용하세요. YouTube 서비스 약관, 저작권, 강의 제공자의 이용 조건을 준수할 책임은 사용자에게 있습니다. DRM 우회 기능은 포함하지 않습니다.
-
-## 라이선스
-
-[MIT License](./LICENSE)
+앱의 **연결과 업데이트**에서 yt-dlp를 업데이트하고, 필요한 경우 Chrome·Edge·Firefox 쿠키를 선택하세요.

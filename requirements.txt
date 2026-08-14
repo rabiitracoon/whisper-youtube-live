@@ -1,6 +1,7 @@
 PySide6>=6.8,<7
-mlx-whisper>=0.4.0,<1
-# 자동 쉬는 시간 찾기의 CPU Silero VAD 모듈만 사용합니다. 전사는 MLX가 담당합니다.
+# Apple Silicon에서는 MLX 전사에 사용하며 Windows에서는 설치하지 않습니다.
+mlx-whisper>=0.4.0,<1; sys_platform == "darwin" and platform_machine == "arm64"
+# Windows에서는 CUDA 전사, macOS에서는 자동 쉬는 시간 찾기의 Silero VAD에 사용합니다.
 faster-whisper>=1.2.1,<2
 yt-dlp[default]>=2026.1.1
 imageio-ffmpeg>=0.6,<1

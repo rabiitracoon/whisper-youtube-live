@@ -38,7 +38,11 @@ from lecture_scribe.transcription import (
     resolve_mlx_model,
     transcribe_audio,
 )
-from lecture_scribe.video_edit import build_video_filter_graph, render_edited_video
+from lecture_scribe.video_edit import (
+    _select_hardware_encoder,
+    build_video_filter_graph,
+    render_edited_video,
+)
 from lecture_scribe.youtube import (
     VideoInfo,
     _is_http_403,
@@ -178,6 +182,7 @@ class MlxTranscriptionTests(unittest.TestCase):
                 patch.dict(
                     "lecture_scribe.transcription.LOCAL_MLX_MODELS", {}, clear=True
                 ),
+                patch("lecture_scribe.transcription.runtime_backend", return_value="mlx"),
                 patch("lecture_scribe.transcription._audio_duration", return_value=3.0),
             ):
                 result = transcribe_audio(
@@ -202,6 +207,39 @@ class MlxTranscriptionTests(unittest.TestCase):
     def test_builds_compact_deduplicated_initial_prompt(self) -> None:
         prompt = _build_initial_prompt(("PyTorch", " pytorch ", "역전파"), limit=40)
         self.assertEqual(prompt, "이 강의의 주요 전문용어: PyTorch, 역전파")
+
+
+class CudaTranscriptionTests(unittest.TestCase):
+    def test_applies_beam_and_terminology_to_faster_whisper(self) -> None:
+        raw = SimpleNamespace(
+            start=0.5,
+            end=1.5,
+            text=" CUDA 전사 ",
+            avg_logprob=-0.1,
+            no_speech_prob=0.01,
+            compression_ratio=1.0,
+        )
+        info = SimpleNamespace(duration=2.0, language="ko", language_probability=0.98)
+        model = MagicMock()
+        model.transcribe.return_value = (iter([raw]), info)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            audio = root / "edited.flac"
+            audio.touch()
+            with (
+                patch("lecture_scribe.transcription.runtime_backend", return_value="cuda"),
+                patch("lecture_scribe.transcription._get_cuda_model", return_value=model),
+            ):
+                result = transcribe_audio(
+                    audio,
+                    root,
+                    VideoInfo("x", "제목", "채널", 2, "https://youtu.be/x"),
+                    beam_size=7,
+                    prompt_terms=("CUDA", "CTranslate2"),
+                )
+        self.assertEqual(result.language_probability, 0.98)
+        self.assertEqual(model.transcribe.call_args.kwargs["beam_size"], 7)
+        self.assertIn("CTranslate2", model.transcribe.call_args.kwargs["initial_prompt"])
 
 
 class TerminologyTests(unittest.TestCase):
@@ -358,6 +396,25 @@ class AudioEditTests(unittest.TestCase):
 
 
 class VideoEditTests(unittest.TestCase):
+    def test_selects_platform_specific_hardware_encoder(self) -> None:
+        with (
+            patch("lecture_scribe.video_edit.platform.system", return_value="Windows"),
+            patch("lecture_scribe.video_edit._ffmpeg_nvenc_usable", return_value=True),
+        ):
+            windows_args, windows_label = _select_hardware_encoder("ffmpeg")
+        with (
+            patch("lecture_scribe.video_edit.platform.system", return_value="Darwin"),
+            patch(
+                "lecture_scribe.video_edit._ffmpeg_videotoolbox_usable",
+                return_value=True,
+            ),
+        ):
+            mac_args, mac_label = _select_hardware_encoder("ffmpeg")
+        self.assertIn("h264_nvenc", windows_args)
+        self.assertIn("NVIDIA NVENC", windows_label)
+        self.assertIn("h264_videotoolbox", mac_args)
+        self.assertIn("Apple VideoToolbox", mac_label)
+
     def test_builds_synchronized_video_and_audio_concat_filter(self) -> None:
         graph = build_video_filter_graph(((10, 20), (40.5, 60)))
         self.assertIn("[0:v]trim=start=10.000000:end=20.000000", graph)
@@ -368,11 +425,11 @@ class VideoEditTests(unittest.TestCase):
         import av
         import imageio_ffmpeg
 
-        from lecture_scribe.video_edit import _ffmpeg_videotoolbox_usable
-
         ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
-        if not _ffmpeg_videotoolbox_usable(ffmpeg_exe):
-            self.skipTest("Apple VideoToolbox is not currently available")
+        try:
+            _, expected_encoder = _select_hardware_encoder(ffmpeg_exe)
+        except RuntimeError:
+            self.skipTest("Platform hardware video encoder is not currently available")
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -413,17 +470,17 @@ class VideoEditTests(unittest.TestCase):
                 duration = float(container.duration / av.time_base)
             self.assertGreater(duration, 2.35)
             self.assertLess(duration, 2.7)
-            self.assertTrue(any("Apple VideoToolbox" in item for item in messages))
+            self.assertTrue(any(expected_encoder in item for item in messages))
 
-    def test_does_not_fall_back_to_cpu_when_videotoolbox_is_unavailable(self) -> None:
+    def test_does_not_fall_back_to_cpu_when_hardware_encoder_is_unavailable(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             source = root / "source.mp4"
             source.write_bytes(b"source")
             with (
                 patch(
-                    "lecture_scribe.video_edit._ffmpeg_videotoolbox_usable",
-                    return_value=False,
+                    "lecture_scribe.video_edit._select_hardware_encoder",
+                    side_effect=RuntimeError("CPU 인코더로 대체하지 않았습니다"),
                 ),
                 patch("lecture_scribe.video_edit._run_ffmpeg") as run_ffmpeg,
                 self.assertRaisesRegex(RuntimeError, "CPU 인코더로 대체하지 않았습니다"),

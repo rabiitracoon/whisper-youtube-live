@@ -20,7 +20,7 @@ from .paths import safe_filename
 from .prompting import PromptContext, render_prompt
 from .quality import TranscriptReview, assess_transcript
 from .time_range import validate_clip_range
-from .transcription import TranscriptResult, transcribe_audio, verify_mlx
+from .transcription import TranscriptResult, transcribe_audio, verify_accelerator
 from .video_edit import render_edited_video
 from .youtube import (
     VideoInfo,
@@ -81,7 +81,7 @@ def run_pipeline(
         if not status.logged_in:
             raise RuntimeError("ChatGPT OAuth 로그인이 필요합니다. 도구 탭에서 로그인해주세요.")
     if needs_transcriber:
-        accelerator_name = verify_mlx()
+        accelerator_name = verify_accelerator()
         if log:
             log(f"전사 가속기 확인 완료: {accelerator_name}")
 
@@ -307,7 +307,7 @@ def run_pipeline(
         included_ranges = tuple(
             (float(start), float(end)) for start, end in state["edit"]["included_ranges"]
         )
-        emit(46, "MLX 전사", "저장된 편집본만 Apple Silicon Whisper에 전달합니다.")
+        emit(46, "GPU 전사", "저장된 편집본을 이 컴퓨터의 Whisper 가속기에 전달합니다.")
         transcript = transcribe_audio(
             audio_path=edited_path,
             output_dir=job_dir,
@@ -315,11 +315,12 @@ def run_pipeline(
             model_name=settings.whisper_model,
             language=settings.language,
             compute_type=settings.compute_type,
+            beam_size=settings.beam_size,
             vad_filter=True,
             original_ranges=included_ranges,
             prompt_terms=prompt_terms,
             progress=lambda ratio, detail: emit(
-                46 + round(ratio * 34), "MLX 전사", detail
+                46 + round(ratio * 34), "GPU 전사", detail
             ),
             log=log,
             cancel_event=cancel_event,
@@ -349,7 +350,7 @@ def run_pipeline(
         )
     elif "transcribe" not in state["completed_stages"]:
         raise RuntimeError(
-            "확인 완료된 전사본이 없습니다. 고급 모드의 ‘3. MLX 전사’를 먼저 실행해주세요."
+            "확인 완료된 전사본이 없습니다. 고급 모드의 ‘3. GPU 전사’를 먼저 실행해주세요."
         )
     if target_stage == "transcribe":
         emit(100, "전사 완료", "전사본을 저장했습니다. AI 노트 단계부터 이어서 할 수 있습니다.")

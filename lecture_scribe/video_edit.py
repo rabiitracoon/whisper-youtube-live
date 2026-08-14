@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import platform
 import subprocess
 from collections.abc import Callable
 from functools import lru_cache
@@ -86,30 +87,14 @@ def render_edited_video(
         "-nostats",
         str(partial_path),
     ]
-    if not _ffmpeg_videotoolbox_usable(ffmpeg_exe):
+    try:
+        encoder_args, encoder_label = _select_hardware_encoder(ffmpeg_exe)
+    except RuntimeError:
         filter_path.unlink(missing_ok=True)
-        raise RuntimeError(
-            "Apple VideoToolbox 하드웨어 인코더를 초기화하지 못했습니다. "
-            "일반 macOS 로그인 세션에서 다시 실행해주세요. "
-            "영상 편집본은 CPU 인코더로 대체하지 않았습니다."
-        )
-    encoder_args = [
-        "-c:v",
-        "h264_videotoolbox",
-        "-allow_sw",
-        "0",
-        "-realtime",
-        "0",
-        "-b:v",
-        "8M",
-        "-maxrate",
-        "12M",
-        "-bufsize",
-        "16M",
-    ]
+        raise
     try:
         if log:
-            log("영상 인코더: Apple VideoToolbox (하드웨어 가속)")
+            log(f"영상 인코더: {encoder_label}")
         try:
             _run_ffmpeg(
                 [*command_prefix, *encoder_args, *command_suffix],
@@ -121,7 +106,7 @@ def render_edited_video(
             raise
         except RuntimeError as exc:
             raise RuntimeError(
-                "Apple VideoToolbox 영상 인코딩에 실패했습니다. "
+                f"{encoder_label} 영상 인코딩에 실패했습니다. "
                 "CPU 인코더로 대체하지 않았습니다.\n"
                 f"{exc}"
             ) from exc
@@ -157,9 +142,50 @@ def _ffmpeg_supports_encoder(ffmpeg_exe: str, encoder: str) -> bool:
     return result.returncode == 0 and encoder in result.stdout
 
 
+def _select_hardware_encoder(ffmpeg_exe: str) -> tuple[list[str], str]:
+    if platform.system() == "Darwin":
+        if not _ffmpeg_videotoolbox_usable(ffmpeg_exe):
+            raise RuntimeError(
+                "Apple VideoToolbox 하드웨어 인코더를 초기화하지 못했습니다. "
+                "일반 macOS 로그인 세션에서 다시 실행해주세요. "
+                "영상 편집본은 CPU 인코더로 대체하지 않았습니다."
+            )
+        return (
+            [
+                "-c:v", "h264_videotoolbox", "-allow_sw", "0", "-realtime", "0",
+                "-b:v", "8M", "-maxrate", "12M", "-bufsize", "16M",
+            ],
+            "Apple VideoToolbox (하드웨어 가속)",
+        )
+    if platform.system() == "Windows":
+        if not _ffmpeg_nvenc_usable(ffmpeg_exe):
+            raise RuntimeError(
+                "NVIDIA NVENC를 초기화하지 못했습니다. NVIDIA 드라이버 상태를 확인하고 "
+                "PC를 재부팅한 뒤 다시 시도하세요. 영상 편집본은 CPU로 대체하지 않았습니다."
+            )
+        return (
+            ["-c:v", "h264_nvenc", "-preset", "p4", "-cq", "21", "-b:v", "0"],
+            "NVIDIA NVENC (GPU 전용)",
+        )
+    raise RuntimeError("영상 하드웨어 인코딩은 Windows 또는 macOS에서만 지원합니다.")
+
+
 @lru_cache(maxsize=8)
 def _ffmpeg_videotoolbox_usable(ffmpeg_exe: str) -> bool:
-    if not _ffmpeg_supports_encoder(ffmpeg_exe, "h264_videotoolbox"):
+    return _ffmpeg_encoder_usable(ffmpeg_exe, "h264_videotoolbox", ("-allow_sw", "0"))
+
+
+@lru_cache(maxsize=8)
+def _ffmpeg_nvenc_usable(ffmpeg_exe: str) -> bool:
+    return _ffmpeg_encoder_usable(ffmpeg_exe, "h264_nvenc")
+
+
+def _ffmpeg_encoder_usable(
+    ffmpeg_exe: str,
+    encoder: str,
+    extra_args: tuple[str, ...] = (),
+) -> bool:
+    if not _ffmpeg_supports_encoder(ffmpeg_exe, encoder):
         return False
     try:
         result = subprocess.run(
@@ -175,9 +201,8 @@ def _ffmpeg_videotoolbox_usable(ffmpeg_exe: str) -> bool:
                 "-frames:v",
                 "1",
                 "-c:v",
-                "h264_videotoolbox",
-                "-allow_sw",
-                "0",
+                encoder,
+                *extra_args,
                 "-f",
                 "null",
                 "-",

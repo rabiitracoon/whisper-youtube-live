@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import platform
 import re
 import shutil
 import subprocess
@@ -15,6 +16,7 @@ from .paths import LOCAL_CODEX_ROOT, PROJECT_ROOT
 
 
 LogCallback = Callable[[str], None]
+INSTALLER_NAME = "install.bat" if platform.system() == "Windows" else "install.command"
 ANSI_RE = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
 
 
@@ -65,7 +67,7 @@ def auth_status(timeout: int = 20) -> AuthStatus:
         return AuthStatus(
             available=False,
             logged_in=False,
-            detail="Codex CLI가 없습니다. install.command를 실행해주세요.",
+            detail=f"Codex CLI가 없습니다. {INSTALLER_NAME}을 실행해주세요.",
         )
     try:
         result = subprocess.run(
@@ -91,7 +93,7 @@ def login(
 ) -> AuthStatus:
     executable = find_codex()
     if not executable:
-        raise FileNotFoundError("Codex CLI가 없습니다. install.command를 실행해주세요.")
+        raise FileNotFoundError(f"Codex CLI가 없습니다. {INSTALLER_NAME}을 실행해주세요.")
     if log:
         log("브라우저에서 ChatGPT 로그인을 완료해주세요. 앱은 OAuth 토큰을 직접 저장하지 않습니다.")
     return_code, _, stderr = _run_streaming(
@@ -197,7 +199,7 @@ def _generate_text(
 ) -> str:
     executable = find_codex()
     if not executable:
-        raise FileNotFoundError("Codex CLI가 없습니다. install.command를 실행해주세요.")
+        raise FileNotFoundError(f"Codex CLI가 없습니다. {INSTALLER_NAME}을 실행해주세요.")
     command = _command_prefix(executable) + [
         "exec",
         "--ephemeral",
