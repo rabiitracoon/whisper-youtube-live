@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import platform
 from pathlib import Path
 
 from PySide6.QtGui import QFont, QFontDatabase
@@ -9,7 +10,7 @@ from PySide6.QtWidgets import QApplication
 
 def configure_fonts(app: QApplication) -> None:
     """Use a native Korean-capable face on macOS (with Windows fallback)."""
-    if os.uname().sysname == "Darwin":
+    if platform.system() == "Darwin":
         font = QFont("Apple SD Gothic Neo", 13)
         font.setStyleStrategy(QFont.StyleStrategy.PreferAntialias)
         app.setFont(font)
