@@ -35,11 +35,22 @@ def find_codex() -> Path | None:
     explicit = os.environ.get("LECTURE_SCRIBE_CODEX")
     if explicit and Path(explicit).exists():
         return Path(explicit).resolve()
-    local_candidates = [
-        LOCAL_CODEX_ROOT / "node_modules" / ".bin" / "codex",
-        LOCAL_CODEX_ROOT / "node_modules" / ".bin" / "codex.cmd",
-        LOCAL_CODEX_ROOT / "node_modules" / ".bin" / "codex.exe",
-    ]
+    bin_root = LOCAL_CODEX_ROOT / "node_modules" / ".bin"
+    if platform.system() == "Windows":
+        # npm creates both a POSIX shell wrapper (codex) and a Windows batch
+        # wrapper (codex.cmd).  Launching the former with subprocess causes
+        # WinError 193, so always prefer the Windows-native wrapper here.
+        local_candidates = [
+            bin_root / "codex.cmd",
+            bin_root / "codex.exe",
+            bin_root / "codex",
+        ]
+    else:
+        local_candidates = [
+            bin_root / "codex",
+            bin_root / "codex.cmd",
+            bin_root / "codex.exe",
+        ]
     for candidate in local_candidates:
         if candidate.exists():
             return candidate.resolve()
