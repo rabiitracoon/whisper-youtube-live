@@ -3,6 +3,7 @@ from __future__ import annotations
 import subprocess
 import tempfile
 import unittest
+import wave
 from types import SimpleNamespace
 from pathlib import Path
 import sys
@@ -16,8 +17,9 @@ from lecture_scribe.audio_edit import (
     normalize_exclusions,
     refine_edge_exclusion_ranges,
 )
-from lecture_scribe.config import AppSettings
+from lecture_scribe.config import AppSettings, load_prompt, save_prompt
 from lecture_scribe.codex_client import _parse_transcription_terms
+from lecture_scribe.local_media import LocalMedia, copy_local_media, resolve_local_media
 from lecture_scribe.paths import safe_filename
 from lecture_scribe.pipeline import (
     _build_prompt,
@@ -120,6 +122,37 @@ class UrlTests(unittest.TestCase):
                 fallback_options["extractor_args"]["youtube"]["player_client"],
                 ["mweb"],
             )
+
+
+class LocalMediaTests(unittest.TestCase):
+    def test_resolves_audio_file_to_local_video_info(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "recording.wav"
+            with wave.open(str(source), "wb") as output:
+                output.setnchannels(1)
+                output.setsampwidth(2)
+                output.setframerate(16_000)
+                output.writeframes(b"\x00\x00" * 16_000)
+            media = resolve_local_media(str(source))
+            self.assertFalse(media.has_video)
+            self.assertEqual(media.video.title, "recording")
+            self.assertAlmostEqual(media.video.duration, 1.0, places=2)
+            self.assertTrue(media.video.video_id.startswith("local_"))
+
+    def test_copy_uses_a_job_folder_copy_without_touching_source(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "recording.m4a"
+            source.write_bytes(b"original audio")
+            media = LocalMedia(
+                path=source,
+                video=VideoInfo("local_abc", "recording", "내 컴퓨터의 파일", 3, str(source)),
+                has_video=False,
+            )
+            target = copy_local_media(media, root / "job")
+            self.assertEqual(target.name, "original_media.m4a")
+            self.assertEqual(target.read_bytes(), b"original audio")
+            self.assertTrue(source.exists())
 
 
 class FormattingTests(unittest.TestCase):
@@ -551,6 +584,25 @@ class SettingsTests(unittest.TestCase):
             self.assertTrue(loaded.keep_video)
             self.assertTrue(loaded.auto_terminology)
             self.assertEqual(loaded.terminology_lecture_name, "운영체제")
+
+    def test_prompt_slots_persist_and_switch_active_prompt(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            legacy_prompt = root / "legacy.md"
+            legacy_prompt.write_text("기본 {{transcript}}" + " 내용" * 20, encoding="utf-8")
+            settings_path = root / "settings.json"
+            settings = AppSettings(prompt_path=str(legacy_prompt))
+            settings.ensure_prompt_slots()
+            settings.add_prompt_slot("주식방송용", "주식 {{transcript}}" + " 분석" * 20)
+            save_prompt(settings, settings.active_prompt_slot()["content"])
+            settings.save(settings_path)
+
+            loaded = AppSettings.load(settings_path)
+            self.assertEqual(len(loaded.prompt_slots), 2)
+            self.assertEqual(loaded.active_prompt_slot()["name"], "주식방송용")
+            self.assertIn("주식", load_prompt(loaded))
+            self.assertTrue(loaded.remove_active_prompt_slot())
+            self.assertEqual(loaded.active_prompt_slot()["name"], "강의용 기본")
 
 
 class CheckpointTests(unittest.TestCase):

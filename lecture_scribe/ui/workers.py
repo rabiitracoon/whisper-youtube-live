@@ -7,6 +7,7 @@ from PySide6.QtCore import QObject, Signal, Slot
 from ..audio_edit import WaveformCancelled
 from ..codex_client import CodexCancelled, auth_status, login, logout
 from ..config import AppSettings
+from ..local_media import LocalMediaCancelled
 from ..pipeline import PipelineCancelled, run_pipeline
 from ..transcription import TranscriptionCancelled
 from ..updater import check_and_update
@@ -54,6 +55,7 @@ class PipelineWorker(QObject):
             DownloadCancelled,
             CodexCancelled,
             WaveformCancelled,
+            LocalMediaCancelled,
         ) as exc:
             self.cancelled.emit(str(exc))
         except Exception as exc:  # UI boundary: present an actionable error to the user.

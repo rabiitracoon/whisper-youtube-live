@@ -42,6 +42,7 @@ from ..prompting import validate_prompt
 from ..quality import TranscriptReview
 from ..time_range import format_timecode, parse_timecode, validate_clip_range
 from ..updater import UpdateResult, current_version
+from ..local_media import resolve_local_media
 from ..youtube import is_youtube_url
 from .audio_editor import AudioEditorDialog
 from .workers import AuthWorker, PipelineWorker, UpdateWorker
@@ -403,13 +404,13 @@ class MainWindow(QMainWindow):
 
         source_card, source = self._card(
             "어떤 강의를 정리할까요?",
-            "YouTube 영상 링크 하나를 붙여넣어 주세요.",
+            "YouTube 링크를 붙여넣거나 내 컴퓨터의 영상·음성 파일을 골라주세요.",
         )
-        url_label = self._field_label("영상 링크")
+        url_label = self._field_label("YouTube 링크 또는 영상·음성 파일")
         self.url_input = QLineEdit(self.settings.last_url)
-        self.url_input.setPlaceholderText("https://www.youtube.com/watch?v=...")
+        self.url_input.setPlaceholderText("YouTube 링크를 붙여넣거나 파일을 선택하세요")
         self.url_input.setClearButtonEnabled(True)
-        self.url_input.setAccessibleName("YouTube 영상 링크")
+        self.url_input.setAccessibleName("YouTube 영상 링크 또는 로컬 영상·음성 파일")
         paste_button = QPushButton("붙여넣기")
         paste_button.setAccessibleName("클립보드에서 YouTube URL 붙여넣기")
         paste_button.clicked.connect(
@@ -418,6 +419,10 @@ class MainWindow(QMainWindow):
         url_row = QHBoxLayout()
         url_row.addWidget(self.url_input, 1)
         url_row.addWidget(paste_button)
+        choose_media_button = QPushButton("파일 선택")
+        choose_media_button.setAccessibleName("전사할 영상 또는 음성 파일 선택")
+        choose_media_button.clicked.connect(self._choose_media_file)
+        url_row.addWidget(choose_media_button)
         source.addWidget(url_label)
         source.addLayout(url_row)
 
@@ -778,17 +783,32 @@ class MainWindow(QMainWindow):
         layout.addLayout(top_row)
 
         prompt_card, prompt_layout = self._card(
-            "노트 작성 방식",
-            "원하는 말투와 구성을 자유롭게 바꿀 수 있어요. {{transcript}}는 강의 글이 들어갈 자리이므로 지우지 마세요.",
+            "노트 작성 방식 · 프롬프트 슬롯",
+            "강의용, 주식방송용처럼 원하는 개수만큼 저장해두고 작업마다 골라 쓸 수 있어요. {{transcript}}는 지우지 마세요.",
         )
+        slot_row = QHBoxLayout()
+        self.prompt_slot_combo = QComboBox()
+        self.prompt_slot_combo.setAccessibleName("사용할 프롬프트 슬롯")
+        self._refresh_prompt_slot_combo()
+        self.prompt_slot_combo.currentIndexChanged.connect(self._change_prompt_slot)
+        add_slot_button = QPushButton("새 슬롯")
+        add_slot_button.clicked.connect(self._add_prompt_slot)
+        rename_slot_button = QPushButton("이름 바꾸기")
+        rename_slot_button.clicked.connect(self._rename_prompt_slot)
+        delete_slot_button = QPushButton("삭제")
+        delete_slot_button.setObjectName("DangerButton")
+        delete_slot_button.clicked.connect(self._delete_prompt_slot)
+        slot_row.addWidget(self._field_label("현재 프롬프트"))
+        slot_row.addWidget(self.prompt_slot_combo, 1)
+        slot_row.addWidget(add_slot_button)
+        slot_row.addWidget(rename_slot_button)
+        slot_row.addWidget(delete_slot_button)
+        prompt_layout.addLayout(slot_row)
         self.prompt_editor = QPlainTextEdit()
         self.prompt_editor.setObjectName("PromptEditor")
         self.prompt_editor.setAccessibleName("강의 노트 작성 방식 편집기")
         self.prompt_editor.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
-        try:
-            self.prompt_editor.setPlainText(load_prompt(self.settings))
-        except OSError as exc:
-            self.prompt_editor.setPlainText(f"노트 작성 방식을 불러오지 못했습니다: {exc}")
+        self.prompt_editor.setPlainText(load_prompt(self.settings))
         prompt_layout.addWidget(self.prompt_editor, 1)
         prompt_actions = QHBoxLayout()
         reset_button = QPushButton("처음 설정으로 되돌리기")
@@ -963,6 +983,76 @@ class MainWindow(QMainWindow):
         if chosen:
             self.folder_input.setText(chosen)
 
+    def _refresh_prompt_slot_combo(self) -> None:
+        self.settings.ensure_prompt_slots()
+        combo = getattr(self, "prompt_slot_combo", None)
+        if combo is None:
+            return
+        combo.blockSignals(True)
+        combo.clear()
+        for slot in self.settings.prompt_slots:
+            combo.addItem(slot["name"], slot["id"])
+        combo.setCurrentIndex(combo.findData(self.settings.active_prompt_slot_id))
+        combo.blockSignals(False)
+
+    def _save_prompt_draft(self) -> None:
+        if hasattr(self, "prompt_editor"):
+            self.settings.active_prompt_slot()["content"] = self.prompt_editor.toPlainText()
+
+    def _change_prompt_slot(self) -> None:
+        if not hasattr(self, "prompt_editor"):
+            return
+        selected_id = str(self.prompt_slot_combo.currentData() or "")
+        if not selected_id or selected_id == self.settings.active_prompt_slot_id:
+            return
+        self._save_prompt_draft()
+        self.settings.active_prompt_slot_id = selected_id
+        self.prompt_editor.setPlainText(load_prompt(self.settings))
+
+    def _add_prompt_slot(self) -> None:
+        self._save_prompt_draft()
+        name, accepted = QInputDialog.getText(self, "새 프롬프트 슬롯", "슬롯 이름")
+        name = " ".join(name.split()).strip()
+        if not accepted or not name:
+            return
+        self.settings.add_prompt_slot(name, DEFAULT_PROMPT_PATH.read_text(encoding="utf-8"))
+        self._refresh_prompt_slot_combo()
+        self.prompt_editor.setPlainText(load_prompt(self.settings))
+
+    def _rename_prompt_slot(self) -> None:
+        slot = self.settings.active_prompt_slot()
+        name, accepted = QInputDialog.getText(
+            self, "프롬프트 슬롯 이름", "슬롯 이름", text=slot["name"]
+        )
+        name = " ".join(name.split()).strip()
+        if accepted and name:
+            slot["name"] = name
+            self._refresh_prompt_slot_combo()
+
+    def _delete_prompt_slot(self) -> None:
+        if len(self.settings.prompt_slots) == 1:
+            self._show_error("프롬프트 슬롯은 하나 이상 남겨야 합니다.")
+            return
+        slot = self.settings.active_prompt_slot()
+        answer = QMessageBox.question(
+            self, "프롬프트 슬롯 삭제", f"‘{slot['name']}’ 슬롯을 삭제할까요?"
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        self.settings.remove_active_prompt_slot()
+        self._refresh_prompt_slot_combo()
+        self.prompt_editor.setPlainText(load_prompt(self.settings))
+
+    def _choose_media_file(self) -> None:
+        chosen, _ = QFileDialog.getOpenFileName(
+            self,
+            "전사할 영상 또는 음성 파일 선택",
+            "",
+            "미디어 파일 (*.mp4 *.m4v *.mov *.mkv *.webm *.avi *.mp3 *.m4a *.wav *.flac *.aac *.ogg *.opus);;모든 파일 (*)",
+        )
+        if chosen:
+            self.url_input.setText(chosen)
+
     def _collect_settings(self) -> AppSettings:
         output_text = self.folder_input.text().strip()
         if not output_text:
@@ -972,6 +1062,7 @@ class MainWindow(QMainWindow):
         model = self.codex_model_input.text().strip()
         if not model:
             raise ValueError("사용할 ChatGPT 모델을 입력해주세요.")
+        self._save_prompt_draft()
         template = self.prompt_editor.toPlainText()
         validate_prompt(template)
         self.settings.output_dir = str(output_dir.resolve())
@@ -1000,15 +1091,19 @@ class MainWindow(QMainWindow):
         return self.settings
 
     def _start_pipeline(self, target_stage: str = "all") -> None:
-        url = self.url_input.text().strip()
-        if not is_youtube_url(url):
-            self._show_error("올바른 단일 YouTube 영상 URL을 입력해주세요.")
-            self.url_input.setFocus()
-            return
+        source = self.url_input.text().strip()
+        if not is_youtube_url(source):
+            try:
+                resolve_local_media(source)
+            except ValueError as exc:
+                self._show_error(f"YouTube 링크 또는 영상·음성 파일을 선택해주세요.\n{exc}")
+                self.url_input.setFocus()
+                return
         try:
             settings = self._collect_settings()
         except (OSError, ValueError) as exc:
             self._show_error(str(exc))
+            self.url_input.setFocus()
             return
         if settings.auto_terminology and target_stage in {"all", "transcribe"}:
             lecture_name, accepted = QInputDialog.getText(
@@ -1024,7 +1119,7 @@ class MainWindow(QMainWindow):
                 self._show_error("전문용어 자동 입력을 사용하려면 강의명을 입력해주세요.")
                 return
             settings.terminology_lecture_name = lecture_name
-        settings.last_url = url
+        settings.last_url = source
         settings.save()
         self.log_view.clear()
         self.result_card.setVisible(False)
@@ -1040,7 +1135,7 @@ class MainWindow(QMainWindow):
         self.cancel_button.setVisible(True)
         self.stage_label.setText("준비 중")
         self.detail_label.setText("필요한 도구와 저장된 작업을 확인하고 있어요.")
-        worker = PipelineWorker(url, settings, target_stage=target_stage)
+        worker = PipelineWorker(source, settings, target_stage=target_stage)
         self.pipeline_worker = worker
         worker.progress.connect(self._on_pipeline_progress)
         worker.log.connect(self._append_pipeline_log)

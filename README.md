@@ -13,13 +13,14 @@ Intel Mac, Linux, NVIDIA GPU가 없는 Windows는 현재 GPU 전사를 지원하
 
 ## 주요 기능
 
-- YouTube 링크로 영상 가져오기 → 쉬는 시간 정리 → 전사 확인 → 학습 노트 생성
+- YouTube 링크 또는 내 컴퓨터의 영상·음성 파일로 가져오기 → 쉬는 시간 정리 → 전사 확인 → 학습 노트 생성
 - 시작·종료 시간 지정과 파형 기반 Razor 편집
 - Silero VAD를 이용한 긴 비음성 구간 자동 감지
 - 쉬는 시간을 동일하게 제거한 H.264/AAC `edited_lecture.mp4` 선택 저장
 - Windows NVIDIA NVENC 및 macOS Apple VideoToolbox 하드웨어 전용 인코딩
 - `checkpoint.json`을 이용한 다운로드·편집·전사·노트 단계 재개
 - 강의명 기반 GPT 전문용어 생성 및 Whisper `initial_prompt` 자동 적용
+- 강의용·주식방송용 등 원하는 개수의 프롬프트 슬롯 저장 및 작업별 선택
 - `transcript.txt`, `transcript.md`, `transcript.srt`, `lecture_notes.md` 저장
 - ChatGPT OAuth 사용, OpenAI API 키와 API 종량제 호출 없음
 
@@ -59,7 +60,7 @@ brew install node
 
 ## 사용 순서
 
-1. **새 강의 노트**에서 단일 YouTube URL을 입력합니다.
+1. **새 강의 노트**에서 단일 YouTube URL을 입력하거나 **파일 선택**으로 영상·음성 파일을 고릅니다.
 2. 필요하면 강의 구간, 언어, Whisper 모델을 설정합니다.
 3. 전문용어 보정이 필요하면 **전문용어 자동 입력**을 켭니다.
 4. 시작할 때 강의명을 입력하면 연결된 GPT가 관련 용어를 생성합니다.
@@ -69,7 +70,7 @@ brew install node
 
 전문용어 자동 입력을 끄고 전사만 사용할 때는 Codex 로그인과 ChatGPT 구독이 필요하지 않습니다. 전문용어 자동 입력에는 앱의 **연결과 업데이트** 화면에서 연결한 ChatGPT 로그인이 필요합니다.
 
-GPT에는 강의명과 YouTube 영상 제목이 전달됩니다. 음성과 Whisper 전사는 컴퓨터에서 로컬로 처리됩니다. 노트 생성 단계에서는 사용자가 확인한 전사문이 Codex에 전달됩니다.
+GPT에는 강의명과 영상 제목이 전달됩니다. 음성과 Whisper 전사는 컴퓨터에서 로컬로 처리됩니다. 로컬 파일을 선택한 경우에도 원본 파일은 수정하거나 삭제하지 않고 작업 폴더에 복사해 사용합니다. 노트 생성 단계에서는 사용자가 확인한 전사문이 Codex에 전달됩니다.
 
 ## Whisper 모델
 

@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
+from uuid import uuid4
 
 from .paths import OUTPUT_ROOT, PROMPT_PATH, SETTINGS_PATH
 
@@ -27,6 +28,8 @@ class AppSettings:
     reasoning_effort: str = "high"
     yt_dlp_channel: str = "nightly"
     prompt_path: str = str(PROMPT_PATH)
+    prompt_slots: list[dict[str, str]] = field(default_factory=list)
+    active_prompt_slot_id: str = ""
 
     @classmethod
     def load(cls, path: Path = SETTINGS_PATH) -> "AppSettings":
@@ -36,7 +39,9 @@ class AppSettings:
             raw = json.loads(path.read_text(encoding="utf-8"))
             allowed = {field.name for field in fields(cls)}
             values = {key: value for key, value in raw.items() if key in allowed}
-            return cls(**values)
+            settings = cls(**values)
+            settings.ensure_prompt_slots()
+            return settings
         except (OSError, ValueError, TypeError):
             return cls()
 
@@ -52,15 +57,59 @@ class AppSettings:
     def prompt_file(self) -> Path:
         return Path(self.prompt_path).expanduser().resolve()
 
+    def ensure_prompt_slots(self) -> None:
+        """Migrate the former single prompt into the first reusable slot."""
+        valid_slots = [
+            {"id": str(item["id"]), "name": str(item["name"]), "content": str(item["content"])}
+            for item in self.prompt_slots
+            if isinstance(item, dict)
+            and item.get("id")
+            and item.get("name")
+            and isinstance(item.get("content"), str)
+        ]
+        if not valid_slots:
+            try:
+                content = self.prompt_file().read_text(encoding="utf-8")
+            except OSError:
+                content = DEFAULT_PROMPT_PATH.read_text(encoding="utf-8")
+            valid_slots = [{"id": "default", "name": "강의용 기본", "content": content}]
+        self.prompt_slots = valid_slots
+        if not any(slot["id"] == self.active_prompt_slot_id for slot in valid_slots):
+            self.active_prompt_slot_id = valid_slots[0]["id"]
+
+    def active_prompt_slot(self) -> dict[str, str]:
+        self.ensure_prompt_slots()
+        return next(
+            slot for slot in self.prompt_slots if slot["id"] == self.active_prompt_slot_id
+        )
+
+    def add_prompt_slot(self, name: str, content: str) -> dict[str, str]:
+        self.ensure_prompt_slots()
+        slot = {"id": uuid4().hex, "name": name, "content": content}
+        self.prompt_slots.append(slot)
+        self.active_prompt_slot_id = slot["id"]
+        return slot
+
+    def remove_active_prompt_slot(self) -> bool:
+        self.ensure_prompt_slots()
+        if len(self.prompt_slots) == 1:
+            return False
+        index = next(
+            index
+            for index, slot in enumerate(self.prompt_slots)
+            if slot["id"] == self.active_prompt_slot_id
+        )
+        self.prompt_slots.pop(index)
+        self.active_prompt_slot_id = self.prompt_slots[max(0, index - 1)]["id"]
+        return True
+
 
 def load_prompt(settings: AppSettings) -> str:
-    prompt_path = settings.prompt_file()
-    if not prompt_path.exists():
-        raise FileNotFoundError(f"프롬프트 파일을 찾을 수 없습니다: {prompt_path}")
-    return prompt_path.read_text(encoding="utf-8")
+    return settings.active_prompt_slot()["content"]
 
 
 def save_prompt(settings: AppSettings, content: str) -> None:
+    settings.active_prompt_slot()["content"] = content.rstrip() + "\n"
     prompt_path = settings.prompt_file()
     prompt_path.parent.mkdir(parents=True, exist_ok=True)
-    prompt_path.write_text(content.rstrip() + "\n", encoding="utf-8")
+    prompt_path.write_text(settings.active_prompt_slot()["content"], encoding="utf-8")

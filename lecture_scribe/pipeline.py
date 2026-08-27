@@ -16,6 +16,7 @@ from .audio_edit import (
 )
 from .codex_client import auth_status, generate_notes, generate_transcription_terms
 from .config import AppSettings, load_prompt
+from .local_media import LocalMediaCancelled, copy_local_media, resolve_local_media
 from .paths import safe_filename
 from .prompting import PromptContext, render_prompt
 from .quality import TranscriptReview, assess_transcript
@@ -28,6 +29,7 @@ from .youtube import (
     download_video,
     fetch_video_info,
     format_duration,
+    is_youtube_url,
 )
 
 ProgressCallback = Callable[[int, str, str], None]
@@ -53,7 +55,7 @@ class PipelineResult:
 
 
 def run_pipeline(
-    url: str,
+    source: str,
     settings: AppSettings,
     progress: ProgressCallback | None = None,
     log: LogCallback | None = None,
@@ -85,8 +87,17 @@ def run_pipeline(
         if log:
             log(f"전사 가속기 확인 완료: {accelerator_name}")
 
-    emit(3, "영상 확인", "YouTube 영상 정보를 읽는 중입니다.")
-    video = fetch_video_info(url, settings.cookie_browser, log)
+    source = source.strip()
+    local_media = None
+    if is_youtube_url(source):
+        emit(3, "영상 확인", "YouTube 영상 정보를 읽는 중입니다.")
+        video = fetch_video_info(source, settings.cookie_browser, log)
+    else:
+        emit(3, "파일 확인", "선택한 영상 또는 음성 파일을 읽는 중입니다.")
+        local_media = resolve_local_media(source)
+        video = local_media.video
+        if settings.keep_video and not local_media.has_video:
+            raise ValueError("음성 파일에는 ‘쉬는 시간을 뺀 영상도 보관하기’를 사용할 수 없습니다.")
     clip_start, clip_end = _resolve_clip_range(
         settings.clip_start_seconds, settings.clip_end_seconds, video, log
     )
@@ -130,38 +141,45 @@ def run_pipeline(
             if log:
                 log("이미 저장된 원본 오디오를 재사용합니다. 다시 다운로드하지 않습니다.")
         else:
-            emit(5, "원본 다운로드", "최고 품질 오디오 스트림을 저장합니다.")
-            audio_path = download_audio(
-                video.webpage_url,
-                video.video_id,
-                job_dir,
-                settings.cookie_browser,
-                progress=lambda ratio, detail: emit(
-                    5 + round(ratio * (7 if settings.keep_video else 15)),
-                    "원본 다운로드",
-                    detail,
-                ),
-                log=log,
-                cancel_event=cancel_event,
-            )
+            if local_media is not None:
+                emit(5, "파일 가져오기", "선택한 파일을 작업 폴더로 안전하게 복사합니다.")
+                audio_path = copy_local_media(local_media, job_dir, cancel_event=cancel_event)
+            else:
+                emit(5, "원본 다운로드", "최고 품질 오디오 스트림을 저장합니다.")
+                audio_path = download_audio(
+                    video.webpage_url,
+                    video.video_id,
+                    job_dir,
+                    settings.cookie_browser,
+                    progress=lambda ratio, detail: emit(
+                        5 + round(ratio * (7 if settings.keep_video else 15)),
+                        "원본 다운로드",
+                        detail,
+                    ),
+                    log=log,
+                    cancel_event=cancel_event,
+                )
         artifacts = {"original_audio": audio_path.name}
         if settings.keep_video:
             if video_path and video_path.exists():
                 if log:
                     log("이미 저장된 원본 영상을 재사용합니다. 다시 다운로드하지 않습니다.")
             else:
-                emit(12, "원본 영상 다운로드", "최대 1080p 영상과 오디오를 저장합니다.")
-                video_path = download_video(
-                    video.webpage_url,
-                    video.video_id,
-                    job_dir,
-                    settings.cookie_browser,
-                    progress=lambda ratio, detail: emit(
-                        12 + round(ratio * 8), "원본 영상 다운로드", detail
-                    ),
-                    log=log,
-                    cancel_event=cancel_event,
-                )
+                if local_media is not None:
+                    video_path = audio_path
+                else:
+                    emit(12, "원본 영상 다운로드", "최대 1080p 영상과 오디오를 저장합니다.")
+                    video_path = download_video(
+                        video.webpage_url,
+                        video.video_id,
+                        job_dir,
+                        settings.cookie_browser,
+                        progress=lambda ratio, detail: emit(
+                            12 + round(ratio * 8), "원본 영상 다운로드", detail
+                        ),
+                        log=log,
+                        cancel_event=cancel_event,
+                    )
             artifacts["original_video"] = video_path.name
         _mark_stage(
             job_dir,
