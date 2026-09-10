@@ -494,6 +494,7 @@ def _ensure_state(state: dict, video: VideoInfo, settings: AppSettings) -> None:
         "keep_video": settings.keep_video,
         "auto_terminology": settings.auto_terminology,
         "terminology_lecture_name": settings.terminology_lecture_name,
+        "terminology_model": settings.terminology_model,
     }
 
 
@@ -530,7 +531,7 @@ def _prepare_transcription_terms(
     terms = generate_transcription_terms(
         lecture_name,
         video_title=video.title,
-        model=settings.codex_model,
+        model=settings.terminology_model,
         reasoning_effort="medium",
         log=log,
         cancel_event=cancel_event,
@@ -539,6 +540,7 @@ def _prepare_transcription_terms(
     terms_path.write_text("\n".join(terms) + "\n", encoding="utf-8")
     state["terminology"] = {
         "lecture_name": lecture_name,
+        "model": settings.terminology_model,
         "count": len(terms),
     }
     state.setdefault("artifacts", {})["transcription_terms"] = terms_path.name
@@ -701,6 +703,7 @@ def _write_metadata(
             "source": "edited_lecture.flac",
             "auto_terminology": settings.auto_terminology,
             "terminology_lecture_name": settings.terminology_lecture_name,
+            "terminology_model": settings.terminology_model,
         },
         "notes": {
             "model": settings.codex_model,

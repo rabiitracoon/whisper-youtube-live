@@ -23,6 +23,7 @@ class AppSettings:
     keep_video: bool = False
     auto_terminology: bool = False
     terminology_lecture_name: str = ""
+    terminology_model: str = "gpt-5.6-luna"
     cookie_browser: str = "none"
     codex_model: str = "gpt-5.6-sol"
     reasoning_effort: str = "high"

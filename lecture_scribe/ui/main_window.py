@@ -737,25 +737,23 @@ class MainWindow(QMainWindow):
         layout.setSpacing(14)
         model_card, model_layout = self._card(
             "노트를 만드는 ChatGPT",
-            "ChatGPT Plus 로그인으로 사용합니다. 별도의 API 키나 추가 결제는 필요하지 않아요.",
+            "노트 작성과 전문용어 생성에 서로 다른 모델을 사용할 수 있습니다.",
         )
         model_grid = QGridLayout()
         self.codex_model_input = QLineEdit(self.settings.codex_model)
-        self.codex_model_input.setAccessibleName("사용할 ChatGPT 모델")
+        self.codex_model_input.setAccessibleName("노트 작성 ChatGPT 모델")
+        self.terminology_model_input = QLineEdit(self.settings.terminology_model)
+        self.terminology_model_input.setAccessibleName("전문용어 생성 ChatGPT 모델")
         self.reasoning_combo = QComboBox()
-        for label, value in [
-            ("빠르게", "low"),
-            ("보통", "medium"),
-            ("꼼꼼하게", "high"),
-            ("아주 꼼꼼하게", "xhigh"),
-            ("가장 깊게", "max"),
-        ]:
-            self.reasoning_combo.addItem(label, value)
+        for reasoning_effort in ["low", "medium", "high", "xhigh", "max"]:
+            self.reasoning_combo.addItem(reasoning_effort, reasoning_effort)
         self._select_data(self.reasoning_combo, self.settings.reasoning_effort)
-        model_grid.addWidget(self._field_label("사용할 모델"), 0, 0)
+        model_grid.addWidget(self._field_label("노트 작성 모델"), 0, 0)
         model_grid.addWidget(self._field_label("생각 깊이"), 0, 1)
         model_grid.addWidget(self.codex_model_input, 1, 0)
         model_grid.addWidget(self.reasoning_combo, 1, 1)
+        model_grid.addWidget(self._field_label("전문용어 생성 모델"), 2, 0)
+        model_grid.addWidget(self.terminology_model_input, 3, 0, 1, 2)
         model_grid.setColumnStretch(0, 2)
         model_grid.setColumnStretch(1, 1)
         model_layout.addLayout(model_grid)
@@ -1061,7 +1059,10 @@ class MainWindow(QMainWindow):
         output_dir.mkdir(parents=True, exist_ok=True)
         model = self.codex_model_input.text().strip()
         if not model:
-            raise ValueError("사용할 ChatGPT 모델을 입력해주세요.")
+            raise ValueError("노트 작성에 사용할 ChatGPT 모델을 입력해주세요.")
+        terminology_model = self.terminology_model_input.text().strip()
+        if not terminology_model:
+            raise ValueError("전문용어 생성에 사용할 ChatGPT 모델을 입력해주세요.")
         self._save_prompt_draft()
         template = self.prompt_editor.toPlainText()
         validate_prompt(template)
@@ -1084,6 +1085,7 @@ class MainWindow(QMainWindow):
         self.settings.beam_size = self.beam_spin.value()
         self.settings.cookie_browser = str(self.cookie_combo.currentData())
         self.settings.codex_model = model
+        self.settings.terminology_model = terminology_model
         self.settings.reasoning_effort = str(self.reasoning_combo.currentData())
         self.settings.yt_dlp_channel = str(self.update_channel_combo.currentData())
         save_prompt(self.settings, template)

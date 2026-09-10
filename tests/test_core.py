@@ -312,6 +312,7 @@ class TerminologyTests(unittest.TestCase):
             settings = AppSettings(
                 auto_terminology=True,
                 terminology_lecture_name="운영체제와 스케줄링",
+                terminology_model="gpt-5.6-luna",
             )
             state = {"artifacts": {}}
             generated = ("운영체제", "CPU 스케줄링", "라운드 로빈")
@@ -336,6 +337,8 @@ class TerminologyTests(unittest.TestCase):
                 "transcription_terms.txt",
             )
             generate.assert_called_once()
+            self.assertEqual(generate.call_args.kwargs["model"], "gpt-5.6-luna")
+            self.assertEqual(state["terminology"]["model"], "gpt-5.6-luna")
 
 
 class TimeRangeTests(unittest.TestCase):
@@ -573,6 +576,7 @@ class SettingsTests(unittest.TestCase):
             settings = AppSettings(
                 beam_size=7,
                 codex_model="gpt-5.6-sol",
+                terminology_model="gpt-5.6-luna",
                 keep_video=True,
                 auto_terminology=True,
                 terminology_lecture_name="운영체제",
@@ -581,6 +585,7 @@ class SettingsTests(unittest.TestCase):
             loaded = AppSettings.load(path)
             self.assertEqual(loaded.beam_size, 7)
             self.assertEqual(loaded.codex_model, "gpt-5.6-sol")
+            self.assertEqual(loaded.terminology_model, "gpt-5.6-luna")
             self.assertTrue(loaded.keep_video)
             self.assertTrue(loaded.auto_terminology)
             self.assertEqual(loaded.terminology_lecture_name, "운영체제")
