@@ -97,6 +97,30 @@ class UrlTests(unittest.TestCase):
                 ["mweb"],
             )
 
+    def test_audio_download_always_uses_bundled_ffmpeg(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            downloaded = root / "video.webm"
+            downloaded.write_bytes(b"audio")
+            downloads = []
+            for _ in range(2):
+                ydl_instance = MagicMock()
+                ydl_instance.__enter__.return_value.extract_info.return_value = {
+                    "requested_downloads": [{"filepath": str(downloaded)}]
+                }
+                downloads.append(ydl_instance)
+
+            with (
+                patch("imageio_ffmpeg.get_ffmpeg_exe", return_value="bundled-ffmpeg"),
+                patch("yt_dlp.YoutubeDL", side_effect=downloads) as ydl,
+            ):
+                download_audio("https://youtu.be/video", "video", root)
+                download_audio("https://youtu.be/video", "video", root)
+
+            self.assertEqual(ydl.call_count, 2)
+            for call in ydl.call_args_list:
+                self.assertEqual(call.args[0]["ffmpeg_location"], "bundled-ffmpeg")
+
     def test_video_download_retries_http_403_with_mweb_client(self) -> None:
         from yt_dlp.utils import DownloadError
 

@@ -49,6 +49,8 @@ def format_duration(seconds: float) -> str:
 
 
 def _base_options(cookie_browser: str, log: LogCallback | None = None) -> dict:
+    import imageio_ffmpeg
+
     options: dict = {
         "noplaylist": True,
         "quiet": True,
@@ -57,6 +59,10 @@ def _base_options(cookie_browser: str, log: LogCallback | None = None) -> dict:
         "socket_timeout": 30,
         "retries": 10,
         "fragment_retries": 10,
+        # Some YouTube audio formats are HLS streams. yt-dlp needs ffmpeg even
+        # when no post-processing is requested, so always point it at the
+        # executable bundled by imageio-ffmpeg instead of relying on PATH.
+        "ffmpeg_location": imageio_ffmpeg.get_ffmpeg_exe(),
     }
     node_path = shutil.which("node")
     if node_path:
@@ -82,7 +88,7 @@ class _YtdlpLogger:
 
     def warning(self, message: str) -> None:
         if message.lower().startswith("ffmpeg not found"):
-            # We intentionally download a single audio-only stream and decode it with PyAV.
+            # Kept as a guard for older yt-dlp versions with misleading probes.
             return
         self.callback(f"경고: {message}")
 
@@ -195,7 +201,6 @@ def download_video(
     cancel_event: Event | None = None,
 ) -> Path:
     """Download a maximum-1080p video with audio and merge it as MP4."""
-    import imageio_ffmpeg
     from yt_dlp import YoutubeDL
     from yt_dlp.utils import DownloadError
 
@@ -205,7 +210,6 @@ def download_video(
         {
             "format": "bv*[height<=1080]+ba/b[height<=1080]/best",
             "merge_output_format": "mp4",
-            "ffmpeg_location": imageio_ffmpeg.get_ffmpeg_exe(),
             "outtmpl": str(destination / "original_video.%(ext)s"),
             "progress_hooks": [
                 _progress_hook(
