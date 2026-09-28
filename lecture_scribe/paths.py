@@ -10,6 +10,7 @@ PROMPT_PATH = PROJECT_ROOT / "prompts" / "lecture_notes_ko.md"
 DEFAULT_PROMPT_PATH = PROJECT_ROOT / "prompts" / "default_lecture_notes_ko.md"
 SETTINGS_PATH = PROJECT_ROOT / "settings.json"
 LOCAL_CODEX_ROOT = PROJECT_ROOT / "tools" / "codex-cli"
+LOCAL_CLAUDE_ROOT = PROJECT_ROOT / "tools" / "claude-code"
 
 
 def safe_filename(value: str, max_length: int = 80) -> str:

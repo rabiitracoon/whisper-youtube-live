@@ -5,7 +5,7 @@ from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from uuid import uuid4
 
-from .paths import OUTPUT_ROOT, PROMPT_PATH, SETTINGS_PATH
+from .paths import DEFAULT_PROMPT_PATH, OUTPUT_ROOT, PROMPT_PATH, SETTINGS_PATH
 
 
 @dataclass(slots=True)
@@ -25,8 +25,12 @@ class AppSettings:
     terminology_lecture_name: str = ""
     terminology_model: str = "gpt-5.6-luna"
     cookie_browser: str = "none"
+    ai_provider: str = "openai"
     codex_model: str = "gpt-5.6-sol"
     reasoning_effort: str = "high"
+    claude_model: str = "opus"
+    claude_reasoning_effort: str = "high"
+    claude_terminology_model: str = "sonnet"
     yt_dlp_channel: str = "nightly"
     prompt_path: str = str(PROMPT_PATH)
     prompt_slots: list[dict[str, str]] = field(default_factory=list)
@@ -54,6 +58,24 @@ class AppSettings:
             encoding="utf-8",
         )
         temp_path.replace(path)
+
+    def ai_selection(self, provider: str | None = None) -> tuple[str, str, str]:
+        """Return (notes model, reasoning effort, terminology model) for a provider."""
+        if (provider or self.ai_provider) == "claude":
+            return self.claude_model, self.claude_reasoning_effort, self.claude_terminology_model
+        return self.codex_model, self.reasoning_effort, self.terminology_model
+
+    def set_ai_selection(
+        self, provider: str, notes_model: str, reasoning_effort: str, terminology_model: str
+    ) -> None:
+        if provider == "claude":
+            self.claude_model = notes_model
+            self.claude_reasoning_effort = reasoning_effort
+            self.claude_terminology_model = terminology_model
+        else:
+            self.codex_model = notes_model
+            self.reasoning_effort = reasoning_effort
+            self.terminology_model = terminology_model
 
     def prompt_file(self) -> Path:
         return Path(self.prompt_path).expanduser().resolve()

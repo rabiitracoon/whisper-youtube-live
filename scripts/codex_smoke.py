@@ -7,14 +7,14 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from lecture_scribe.codex_client import auth_status, generate_notes
+from lecture_scribe.ai_providers import auth_status, generate_notes
 from lecture_scribe.prompting import PromptContext, render_prompt
 
 
 def main() -> int:
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-    status = auth_status()
+    status = auth_status("openai")
     print(status.detail)
     if not status.logged_in:
         print("ChatGPT OAuth login is required.", file=sys.stderr)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import platform
 import re
@@ -139,66 +140,44 @@ def logout() -> AuthStatus:
     return auth_status()
 
 
-def generate_notes(
-    prompt: str,
-    output_path: Path,
-    model: str = "gpt-5.6-sol",
-    reasoning_effort: str = "high",
-    log: LogCallback | None = None,
-    cancel_event: Event | None = None,
-) -> Path:
-    final_text = _generate_text(
-        prompt,
-        model=model,
-        reasoning_effort=reasoning_effort,
-        log=log,
-        cancel_event=cancel_event,
-        activity="강의 노트를 생성합니다",
-        failure_message="AI 노트 생성에 실패했습니다.",
-    )
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(final_text.rstrip() + "\n", encoding="utf-8")
-    return output_path.resolve()
+def fetch_model_catalog(timeout: int = 30) -> list[dict]:
+    """Return the model catalog that the installed Codex CLI offers this account."""
+    executable = find_codex()
+    if not executable:
+        raise FileNotFoundError(f"Codex CLI가 없습니다. {INSTALLER_NAME}을 실행해주세요.")
+    last_error = "Codex 모델 목록을 읽지 못했습니다."
+    # The live catalog follows the signed-in account; the bundled one still
+    # reflects this CLI version when the network or login is unavailable.
+    for extra in ([], ["--bundled"]):
+        try:
+            result = subprocess.run(
+                _command_prefix(executable) + ["debug", "models", *extra],
+                cwd=PROJECT_ROOT,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=timeout,
+                creationflags=_creation_flags(),
+                env=_clean_env(),
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            last_error = f"Codex 모델 목록 확인 실패: {exc}"
+            continue
+        if result.returncode != 0:
+            last_error = _last_error(result.stderr, last_error)
+            continue
+        try:
+            models = json.loads(result.stdout).get("models")
+        except (ValueError, AttributeError):
+            last_error = "Codex 모델 목록 형식을 해석하지 못했습니다."
+            continue
+        if isinstance(models, list) and models:
+            return models
+    raise RuntimeError(last_error)
 
 
-def generate_transcription_terms(
-    lecture_name: str,
-    *,
-    video_title: str = "",
-    model: str = "gpt-5.6-sol",
-    reasoning_effort: str = "medium",
-    log: LogCallback | None = None,
-    cancel_event: Event | None = None,
-    max_terms: int = 40,
-) -> tuple[str, ...]:
-    name = " ".join(lecture_name.split()).strip()
-    if not name:
-        raise ValueError("전문용어를 만들 강의명을 입력해주세요.")
-    prompt = f"""당신은 음성 인식용 전문용어 사전을 만드는 조교입니다.
-
-사용자가 입력한 강의명: {name}
-YouTube 영상 제목: {video_title.strip() or '(제공되지 않음)'}
-
-이 강의에서 실제로 발음될 가능성이 높은 한국어·영어 전문용어, 고유명사, 약어, 인명, 제품명, 라이브러리명, 수식 명칭을 최대 {max_terms}개 선정하세요.
-Whisper 음성 인식의 철자 정확도를 높이는 것이 목적입니다. 일반적인 쉬운 단어, 설명, 번역, 문장, 추측성이 큰 단어는 제외하세요.
-각 줄에는 전문용어 하나만 쓰고 번호, 글머리표, Markdown 코드블록, 부연 설명을 절대 넣지 마세요.
-"""
-    raw = _generate_text(
-        prompt,
-        model=model,
-        reasoning_effort=reasoning_effort,
-        log=log,
-        cancel_event=cancel_event,
-        activity=f"‘{name}’ 강의의 전사 전문용어를 생성합니다",
-        failure_message="전사 전문용어 생성에 실패했습니다.",
-    )
-    terms = _parse_transcription_terms(raw, max_terms=max_terms)
-    if not terms:
-        raise RuntimeError("GPT가 사용할 수 있는 전문용어를 반환하지 않았습니다.")
-    return terms
-
-
-def _generate_text(
+def generate_text(
     prompt: str,
     *,
     model: str,
@@ -245,25 +224,6 @@ def _generate_text(
     if not final_text:
         raise RuntimeError("Codex 실행은 끝났지만 결과가 비어 있습니다.")
     return final_text
-
-
-def _parse_transcription_terms(value: str, max_terms: int = 40) -> tuple[str, ...]:
-    terms: list[str] = []
-    seen: set[str] = set()
-    cleaned = _clean_output(value).replace("```text", "").replace("```", "")
-    for line in cleaned.splitlines():
-        candidate = re.sub(r"^\s*(?:[-*•]|\d+[.)])\s*", "", line).strip()
-        candidate = candidate.strip("`'\" ")
-        if not candidate or len(candidate) > 80 or candidate.endswith(":"):
-            continue
-        key = candidate.casefold()
-        if key in seen:
-            continue
-        seen.add(key)
-        terms.append(candidate)
-        if len(terms) >= max_terms:
-            break
-    return tuple(terms)
 
 
 def _run_streaming(
@@ -331,6 +291,10 @@ def _run_streaming(
 
 def _clean_env() -> dict[str, str]:
     env = os.environ.copy()
+    # Launched from inside a Claude Code session, these would make the child
+    # CLI believe it is nested and change its behaviour.
+    for name in ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT"):
+        env.pop(name, None)
     env["NO_COLOR"] = "1"
     env["TERM"] = "dumb"
     return env

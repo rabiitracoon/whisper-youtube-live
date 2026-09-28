@@ -5,7 +5,8 @@ from threading import Event
 from PySide6.QtCore import QObject, Signal, Slot
 
 from ..audio_edit import WaveformCancelled
-from ..codex_client import CodexCancelled, auth_status, login, logout
+from ..ai_providers import auth_status, fetch_catalog, login, logout
+from ..codex_client import CodexCancelled
 from ..config import AppSettings
 from ..local_media import LocalMediaCancelled
 from ..pipeline import PipelineCancelled, run_pipeline
@@ -109,21 +110,22 @@ class AuthWorker(QObject):
     error = Signal(str)
     finished = Signal()
 
-    def __init__(self, action: str):
+    def __init__(self, action: str, provider: str):
         super().__init__()
         self.action = action
+        self.provider = provider
         self.cancel_event = Event()
 
     @Slot()
     def run(self) -> None:
         try:
             if self.action == "login":
-                value = login(self.log.emit, self.cancel_event)
+                value = login(self.provider, self.log.emit, self.cancel_event)
             elif self.action == "logout":
-                value = logout()
+                value = logout(self.provider)
             else:
-                value = auth_status()
-            self.result.emit(value)
+                value = auth_status(self.provider)
+            self.result.emit((self.provider, value))
         except Exception as exc:
             self.error.emit(str(exc))
         finally:
@@ -131,6 +133,23 @@ class AuthWorker(QObject):
 
     def cancel(self) -> None:
         self.cancel_event.set()
+
+
+class ModelListWorker(QObject):
+    result = Signal(object)
+    finished = Signal()
+
+    def __init__(self, provider: str):
+        super().__init__()
+        self.provider = provider
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            # fetch_catalog never raises for CLI problems; it falls back instead.
+            self.result.emit(fetch_catalog(self.provider))
+        finally:
+            self.finished.emit()
 
 
 class UpdateWorker(QObject):

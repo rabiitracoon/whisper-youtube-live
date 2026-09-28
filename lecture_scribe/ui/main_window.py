@@ -33,7 +33,16 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ..codex_client import AuthStatus, find_codex
+from ..ai_providers import (
+    PROVIDER_CHOICES,
+    PROVIDER_NAMES,
+    TOOL_NAMES,
+    ModelCatalog,
+    fallback_catalog,
+    find_tool,
+    normalize_provider,
+)
+from ..codex_client import AuthStatus
 from ..config import AppSettings, load_prompt, save_prompt
 from ..diagnostics import get_gpu_info
 from ..paths import DEFAULT_PROMPT_PATH
@@ -45,7 +54,7 @@ from ..updater import UpdateResult, current_version
 from ..local_media import resolve_local_media
 from ..youtube import is_youtube_url
 from .audio_editor import AudioEditorDialog
-from .workers import AuthWorker, PipelineWorker, UpdateWorker
+from .workers import AuthWorker, ModelListWorker, PipelineWorker, UpdateWorker
 
 
 ASSET_DIR = Path(__file__).resolve().parent / "assets"
@@ -72,10 +81,13 @@ class MainWindow(QMainWindow):
         self.setMinimumSize(1080, 720)
         self.resize(1280, 860)
         self._notification_tray: QSystemTrayIcon | None = None
+        self._model_catalogs: dict[str, ModelCatalog] = {}
+        self._loading_catalogs: set[str] = set()
         self._build_ui()
         self._setup_notifications()
         self._refresh_local_status()
         QTimer.singleShot(400, lambda: self._run_auth_action("status"))
+        QTimer.singleShot(600, lambda: self._load_model_catalog(self._current_provider()))
 
     def _build_ui(self) -> None:
         root = QWidget()
@@ -213,9 +225,9 @@ class MainWindow(QMainWindow):
         environment_title.setObjectName("SidebarCardTitle")
         environment_layout.addWidget(environment_title)
         self.gpu_badge = QLabel("컴퓨터 확인 중")
-        self.ai_badge = QLabel("ChatGPT 확인 중")
+        self.ai_badge = QLabel("AI 확인 중")
         self._set_badge(self.gpu_badge, "컴퓨터 확인 중", "neutral")
-        self._set_badge(self.ai_badge, "ChatGPT 확인 중", "neutral")
+        self._set_badge(self.ai_badge, "AI 확인 중", "neutral")
         environment_layout.addWidget(self.gpu_badge)
         environment_layout.addWidget(self.ai_badge)
         layout.addWidget(environment)
@@ -249,7 +261,7 @@ class MainWindow(QMainWindow):
         page_copy = [
             ("새 강의 노트", "영상 링크 하나로 공부하기 좋은 노트를 만드세요."),
             ("노트 작성 방식", "내가 공부하는 방식에 맞게 노트의 말투와 구성을 정하세요."),
-            ("연결과 업데이트", "컴퓨터와 ChatGPT 연결 상태를 한곳에서 관리하세요."),
+            ("연결과 업데이트", "컴퓨터와 AI 서비스 연결 상태를 한곳에서 관리하세요."),
         ]
         self.tabs.setCurrentIndex(index)
         self.page_title.setText(page_copy[index][0])
@@ -300,9 +312,9 @@ class MainWindow(QMainWindow):
         badges.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         badges.setSpacing(7)
         self.gpu_badge = QLabel("컴퓨터 확인 중")
-        self.ai_badge = QLabel("ChatGPT 확인 중")
+        self.ai_badge = QLabel("AI 확인 중")
         self._set_badge(self.gpu_badge, "컴퓨터 확인 중", "neutral")
-        self._set_badge(self.ai_badge, "ChatGPT 확인 중", "neutral")
+        self._set_badge(self.ai_badge, "AI 확인 중", "neutral")
         badges.addWidget(self.gpu_badge, 0, Qt.AlignmentFlag.AlignRight)
         badges.addWidget(self.ai_badge, 0, Qt.AlignmentFlag.AlignRight)
         top.addLayout(badges)
@@ -477,7 +489,7 @@ class MainWindow(QMainWindow):
         self.auto_terminology_check = QCheckBox("전문용어 자동 입력")
         self.auto_terminology_check.setChecked(self.settings.auto_terminology)
         self.auto_terminology_check.setToolTip(
-            "시작할 때 강의명을 입력하면 연결된 GPT가 관련 전문용어를 만들고 "
+            "시작할 때 강의명을 입력하면 연결된 AI가 관련 전문용어를 만들고 "
             "Whisper 전사 문맥에 자동 적용합니다."
         )
         options.addWidget(self.auto_terminology_check)
@@ -736,27 +748,47 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(0, 12, 0, 0)
         layout.setSpacing(14)
         model_card, model_layout = self._card(
-            "노트를 만드는 ChatGPT",
-            "노트 작성과 전문용어 생성에 서로 다른 모델을 사용할 수 있습니다.",
+            "노트를 만드는 AI",
+            "ChatGPT 또는 Claude를 고르고, 연결된 계정에서 쓸 수 있는 최신 모델 중에 선택하세요.",
         )
         model_grid = QGridLayout()
-        self.codex_model_input = QLineEdit(self.settings.codex_model)
-        self.codex_model_input.setAccessibleName("노트 작성 ChatGPT 모델")
-        self.terminology_model_input = QLineEdit(self.settings.terminology_model)
-        self.terminology_model_input.setAccessibleName("전문용어 생성 ChatGPT 모델")
+        self.provider_combo = QComboBox()
+        self.provider_combo.setAccessibleName("노트 작성 AI 서비스")
+        for provider, label in PROVIDER_CHOICES:
+            self.provider_combo.addItem(label, provider)
+        self._select_data(self.provider_combo, normalize_provider(self.settings.ai_provider))
+        self._active_provider = self._current_provider()
+        self.refresh_models_button = QPushButton("모델 목록 새로고침")
+        self.refresh_models_button.clicked.connect(
+            lambda: self._load_model_catalog(self._current_provider(), force=True)
+        )
+        self.notes_model_combo = QComboBox()
+        self.notes_model_combo.setAccessibleName("노트 작성 모델")
+        self.terminology_model_combo = QComboBox()
+        self.terminology_model_combo.setAccessibleName("전문용어 생성 모델")
         self.reasoning_combo = QComboBox()
-        for reasoning_effort in ["low", "medium", "high", "xhigh", "max"]:
-            self.reasoning_combo.addItem(reasoning_effort, reasoning_effort)
-        self._select_data(self.reasoning_combo, self.settings.reasoning_effort)
-        model_grid.addWidget(self._field_label("노트 작성 모델"), 0, 0)
-        model_grid.addWidget(self._field_label("생각 깊이"), 0, 1)
-        model_grid.addWidget(self.codex_model_input, 1, 0)
-        model_grid.addWidget(self.reasoning_combo, 1, 1)
-        model_grid.addWidget(self._field_label("전문용어 생성 모델"), 2, 0)
-        model_grid.addWidget(self.terminology_model_input, 3, 0, 1, 2)
+        self.reasoning_combo.setAccessibleName("생각 깊이")
+        self.model_source_label = QLabel("")
+        self.model_source_label.setObjectName("HelperText")
+        self.model_source_label.setWordWrap(True)
+        model_grid.addWidget(self._field_label("AI 서비스"), 0, 0)
+        model_grid.addWidget(self.provider_combo, 1, 0)
+        model_grid.addWidget(self.refresh_models_button, 1, 1)
+        model_grid.addWidget(self._field_label("노트 작성 모델"), 2, 0)
+        model_grid.addWidget(self._field_label("생각 깊이"), 2, 1)
+        model_grid.addWidget(self.notes_model_combo, 3, 0)
+        model_grid.addWidget(self.reasoning_combo, 3, 1)
+        model_grid.addWidget(self._field_label("전문용어 생성 모델"), 4, 0)
+        model_grid.addWidget(self.terminology_model_combo, 5, 0, 1, 2)
+        model_grid.addWidget(self.model_source_label, 6, 0, 1, 2)
         model_grid.setColumnStretch(0, 2)
         model_grid.setColumnStretch(1, 1)
         model_layout.addLayout(model_grid)
+        self._populate_model_combos()
+        self.provider_combo.currentIndexChanged.connect(self._change_provider)
+        self.notes_model_combo.currentIndexChanged.connect(
+            lambda: self._populate_reasoning_combo()
+        )
         model_card.setProperty("cardRole", "model")
 
         profile = QFrame()
@@ -844,15 +876,27 @@ class MainWindow(QMainWindow):
         gpu_card.setProperty("cardRole", "system")
 
         auth_card, auth_layout = self._card(
-            "ChatGPT 연결",
+            "AI 서비스 연결",
             "로그인은 공식 연결 창에서 진행합니다. 이 앱은 비밀번호를 보거나 저장하지 않아요.",
         )
+        auth_provider_row = QHBoxLayout()
+        self.auth_provider_combo = QComboBox()
+        self.auth_provider_combo.setAccessibleName("연결을 관리할 AI 서비스")
+        for provider, label in PROVIDER_CHOICES:
+            self.auth_provider_combo.addItem(label, provider)
+        self._select_data(self.auth_provider_combo, self._current_provider())
+        self.auth_provider_combo.currentIndexChanged.connect(
+            lambda: self._run_auth_action("status")
+        )
+        auth_provider_row.addWidget(self._field_label("관리할 서비스"))
+        auth_provider_row.addWidget(self.auth_provider_combo, 1)
+        auth_layout.addLayout(auth_provider_row)
         self.auth_detail = QLabel("확인 중")
         self.auth_detail.setWordWrap(True)
         self.auth_detail.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         auth_layout.addWidget(self.auth_detail)
         auth_actions = QHBoxLayout()
-        self.login_button = QPushButton("ChatGPT 연결하기")
+        self.login_button = QPushButton("연결하기")
         self.login_button.setObjectName("PrimaryButton")
         self.login_button.clicked.connect(lambda: self._run_auth_action("login"))
         self.logout_button = QPushButton("로그아웃")
@@ -957,13 +1001,16 @@ class MainWindow(QMainWindow):
         else:
             self._set_badge(self.gpu_badge, "컴퓨터 확인 필요", "warn")
             self.gpu_detail.setText(f"GPU 가속 환경을 확인하지 못했습니다. {gpu.detail}")
-        codex = find_codex()
-        codex_text = (
-            str(codex)
-            if codex
-            else f"연결 도구를 찾지 못했습니다 · {INSTALLER_NAME}을 먼저 실행해주세요."
+        provider = self._auth_provider()
+        tool = find_tool(provider)
+        tool_text = (
+            str(tool)
+            if tool
+            else f"{TOOL_NAMES[provider]}를 찾지 못했습니다 · {INSTALLER_NAME}을 먼저 실행해주세요."
         )
-        self.auth_detail.setText(f"연결 도구: {codex_text}\nChatGPT 로그인 상태를 확인하고 있습니다.")
+        self.auth_detail.setText(
+            f"연결 도구: {tool_text}\n{PROVIDER_NAMES[provider]} 로그인 상태를 확인하고 있습니다."
+        )
 
     def _set_badge(self, label: QLabel, text: str, state: str) -> None:
         object_name = {"good": "StatusGood", "warn": "StatusWarn"}.get(
@@ -1057,12 +1104,13 @@ class MainWindow(QMainWindow):
             raise ValueError("결과 저장 폴더를 선택해주세요.")
         output_dir = Path(output_text).expanduser()
         output_dir.mkdir(parents=True, exist_ok=True)
-        model = self.codex_model_input.text().strip()
+        provider = self._current_provider()
+        model = str(self.notes_model_combo.currentData() or "")
         if not model:
-            raise ValueError("노트 작성에 사용할 ChatGPT 모델을 입력해주세요.")
-        terminology_model = self.terminology_model_input.text().strip()
+            raise ValueError("노트 작성에 사용할 AI 모델을 선택해주세요.")
+        terminology_model = str(self.terminology_model_combo.currentData() or "")
         if not terminology_model:
-            raise ValueError("전문용어 생성에 사용할 ChatGPT 모델을 입력해주세요.")
+            raise ValueError("전문용어 생성에 사용할 AI 모델을 선택해주세요.")
         self._save_prompt_draft()
         template = self.prompt_editor.toPlainText()
         validate_prompt(template)
@@ -1084,9 +1132,10 @@ class MainWindow(QMainWindow):
         self.settings.auto_terminology = self.auto_terminology_check.isChecked()
         self.settings.beam_size = self.beam_spin.value()
         self.settings.cookie_browser = str(self.cookie_combo.currentData())
-        self.settings.codex_model = model
-        self.settings.terminology_model = terminology_model
-        self.settings.reasoning_effort = str(self.reasoning_combo.currentData())
+        self.settings.ai_provider = provider
+        self.settings.set_ai_selection(
+            provider, model, str(self.reasoning_combo.currentData() or ""), terminology_model
+        )
         self.settings.yt_dlp_channel = str(self.update_channel_combo.currentData())
         save_prompt(self.settings, template)
         self.settings.save()
@@ -1167,7 +1216,7 @@ class MainWindow(QMainWindow):
     def _friendly_progress(stage: str, detail: str) -> tuple[str, str]:
         combined = f"{stage} {detail}".lower()
         if "전문용어" in combined or "terminology" in combined:
-            return "전문용어 준비 중", "강의명에 맞는 단어를 GPT로 만들고 있어요."
+            return "전문용어 준비 중", "강의명에 맞는 단어를 AI로 만들고 있어요."
         if any(word in combined for word in ("download", "다운로드", "원본")):
             return "영상 가져오는 중", "영상의 소리를 안전하게 가져오고 있어요."
         if any(word in combined for word in ("waveform", "파형", "edit", "편집")):
@@ -1258,7 +1307,7 @@ class MainWindow(QMainWindow):
             )
         else:
             self.review_approve_button.setText("확인했어요 · 노트 만들기")
-            self.detail_label.setText("81% · 확인하기 전에는 ChatGPT가 시작되지 않습니다.")
+            self.detail_label.setText("81% · 확인하기 전에는 AI 노트 작성이 시작되지 않습니다.")
             self._append_pipeline_log(
                 "강의 글 만들기가 끝났습니다. 화면에서 내용을 확인한 뒤 노트를 만들어주세요."
             )
@@ -1325,26 +1374,158 @@ class MainWindow(QMainWindow):
         if answer == QMessageBox.StandardButton.Yes:
             self.prompt_editor.setPlainText(DEFAULT_PROMPT_PATH.read_text(encoding="utf-8"))
 
+    def _current_provider(self) -> str:
+        return normalize_provider(str(self.provider_combo.currentData() or ""))
+
+    def _auth_provider(self) -> str:
+        combo = getattr(self, "auth_provider_combo", None)
+        if combo is None:
+            return self._current_provider()
+        return normalize_provider(str(combo.currentData() or ""))
+
+    def _remember_model_selection(self) -> None:
+        """Keep the combos' choice for the provider they currently show."""
+        notes_model = str(self.notes_model_combo.currentData() or "")
+        terminology_model = str(self.terminology_model_combo.currentData() or "")
+        if notes_model and terminology_model:
+            self.settings.set_ai_selection(
+                self._active_provider,
+                notes_model,
+                str(self.reasoning_combo.currentData() or ""),
+                terminology_model,
+            )
+
+    def _change_provider(self) -> None:
+        self._remember_model_selection()
+        provider = self._current_provider()
+        self._active_provider = provider
+        self._populate_model_combos()
+        self._load_model_catalog(provider)
+        if self._auth_provider() != provider:
+            # Changing the combo also checks the new provider's login status.
+            self._select_data(self.auth_provider_combo, provider)
+
+    def _load_model_catalog(self, provider: str, force: bool = False) -> None:
+        catalog = self._model_catalogs.get(provider)
+        if provider in self._loading_catalogs or (catalog and catalog.live and not force):
+            return
+        self._loading_catalogs.add(provider)
+        if provider == self._current_provider():
+            self.refresh_models_button.setEnabled(False)
+            self.model_source_label.setText(
+                f"{TOOL_NAMES[provider]}에서 최신 모델 목록을 불러오는 중입니다…"
+            )
+        worker = ModelListWorker(provider)
+        worker.result.connect(self._on_model_catalog)
+        worker.finished.connect(lambda: self._on_model_catalog_finished(provider))
+        self._launch_worker(worker)
+
+    def _on_model_catalog(self, catalog: ModelCatalog) -> None:
+        self._model_catalogs[catalog.provider] = catalog
+        if not catalog.live and catalog.detail:
+            self._append_tool_log(
+                f"{TOOL_NAMES[catalog.provider]} 모델 목록을 불러오지 못해 기본 목록을 사용합니다: "
+                f"{catalog.detail}"
+            )
+        if catalog.provider == self._current_provider():
+            self._remember_model_selection()
+            self._populate_model_combos()
+
+    def _on_model_catalog_finished(self, provider: str) -> None:
+        self._loading_catalogs.discard(provider)
+        if provider == self._current_provider():
+            self.refresh_models_button.setEnabled(True)
+            self._update_model_source_label()
+
+    def _catalog(self) -> ModelCatalog:
+        provider = self._current_provider()
+        return self._model_catalogs.get(provider) or fallback_catalog(provider)
+
+    def _populate_model_combos(self) -> None:
+        provider = self._current_provider()
+        catalog = self._catalog()
+        notes_model, reasoning_effort, terminology_model = self.settings.ai_selection(provider)
+        for combo, selected in (
+            (self.notes_model_combo, notes_model),
+            (self.terminology_model_combo, terminology_model),
+        ):
+            combo.blockSignals(True)
+            combo.clear()
+            for model in catalog.models:
+                combo.addItem(model.label, model.value)
+                combo.setItemData(
+                    combo.count() - 1,
+                    f"{model.value}\n{model.description}".strip(),
+                    Qt.ItemDataRole.ToolTipRole,
+                )
+            if selected and combo.findData(selected) < 0:
+                # A model saved earlier that the current catalog no longer lists.
+                combo.insertItem(0, f"{selected} · 목록에 없음", selected)
+            index = combo.findData(selected)
+            combo.setCurrentIndex(index if index >= 0 else 0)
+            combo.blockSignals(False)
+        self._populate_reasoning_combo(reasoning_effort)
+        self._update_model_source_label()
+
+    def _update_model_source_label(self) -> None:
+        provider = self._current_provider()
+        if provider in self._loading_catalogs:
+            return
+        if self._catalog().live:
+            text = f"{TOOL_NAMES[provider]}가 알려준 현재 계정의 최신 모델 목록입니다."
+        else:
+            text = (
+                f"기본 모델 목록입니다. {TOOL_NAMES[provider]}를 설치하면 "
+                "계정에서 쓸 수 있는 최신 목록을 불러옵니다."
+            )
+        self.model_source_label.setText(text)
+
+    def _populate_reasoning_combo(self, preferred: str | None = None) -> None:
+        if preferred is None:
+            preferred = str(self.reasoning_combo.currentData() or "")
+        selected = str(self.notes_model_combo.currentData() or "")
+        model = next((item for item in self._catalog().models if item.value == selected), None)
+        efforts = model.efforts if model else ("low", "medium", "high", "xhigh", "max")
+        default = model.default_effort if model else ""
+        self.reasoning_combo.blockSignals(True)
+        self.reasoning_combo.clear()
+        for effort in efforts:
+            self.reasoning_combo.addItem(f"{effort} · 기본값" if effort == default else effort, effort)
+        if not efforts:
+            self.reasoning_combo.addItem("이 모델은 조절 불가", "")
+        self.reasoning_combo.setEnabled(bool(efforts))
+        index = self.reasoning_combo.findData(preferred)
+        if index < 0:
+            index = max(0, self.reasoning_combo.findData(default))
+        self.reasoning_combo.setCurrentIndex(index)
+        self.reasoning_combo.blockSignals(False)
+
     def _run_auth_action(self, action: str) -> None:
+        provider = self._auth_provider()
         self.login_button.setEnabled(False)
         self.logout_button.setEnabled(False)
         if action == "login":
-            self.tool_log.appendPlainText("ChatGPT 연결을 시작합니다.")
-        worker = AuthWorker(action)
+            self.tool_log.appendPlainText(f"{PROVIDER_NAMES[provider]} 연결을 시작합니다.")
+        worker = AuthWorker(action, provider)
         worker.log.connect(self._append_tool_log)
         worker.result.connect(self._on_auth_result)
         worker.error.connect(self._on_tool_error)
         worker.finished.connect(lambda: self._set_auth_buttons_enabled(True))
         self._launch_worker(worker)
 
-    def _on_auth_result(self, status: AuthStatus) -> None:
-        codex = find_codex()
-        prefix = f"연결 도구: {codex or '찾지 못함'}"
-        self.auth_detail.setText(f"{prefix}\n{status.detail}")
+    def _on_auth_result(self, value: tuple[str, AuthStatus]) -> None:
+        provider, status = value
+        name = PROVIDER_NAMES[provider]
+        if provider == self._auth_provider():
+            tool = find_tool(provider)
+            self.auth_detail.setText(f"연결 도구: {tool or '찾지 못함'}\n{status.detail}")
+            self.login_button.setText(f"{name} 연결하기")
+        if provider != self._current_provider():
+            return
         if status.logged_in:
-            self._set_badge(self.ai_badge, "ChatGPT 연결됨", "good")
+            self._set_badge(self.ai_badge, f"{name} 연결됨", "good")
         elif status.available:
-            self._set_badge(self.ai_badge, "ChatGPT 로그인 필요", "warn")
+            self._set_badge(self.ai_badge, f"{name} 로그인 필요", "warn")
         else:
             self._set_badge(self.ai_badge, "연결 도구 설치 필요", "warn")
 
