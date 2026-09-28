@@ -18,7 +18,14 @@ from lecture_scribe.audio_edit import (
     refine_edge_exclusion_ranges,
 )
 from lecture_scribe.config import AppSettings, load_prompt, save_prompt
-from lecture_scribe.codex_client import _parse_transcription_terms
+from lecture_scribe.ai_providers import (
+    CLAUDE,
+    OPENAI,
+    _parse_claude_models,
+    _parse_codex_models,
+    _parse_transcription_terms,
+    fetch_catalog,
+)
 from lecture_scribe.local_media import LocalMedia, copy_local_media, resolve_local_media
 from lecture_scribe.paths import safe_filename
 from lecture_scribe.pipeline import (
@@ -364,6 +371,79 @@ class TerminologyTests(unittest.TestCase):
             self.assertEqual(generate.call_args.kwargs["model"], "gpt-5.6-luna")
             self.assertEqual(state["terminology"]["model"], "gpt-5.6-luna")
 
+    def test_uses_the_selected_claude_models_for_terms(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            settings = AppSettings(
+                auto_terminology=True,
+                terminology_lecture_name="운영체제",
+                ai_provider="claude",
+                claude_terminology_model="sonnet",
+            )
+            state = {"artifacts": {}}
+            with patch(
+                "lecture_scribe.pipeline.generate_transcription_terms",
+                return_value=("운영체제",),
+            ) as generate:
+                _prepare_transcription_terms(
+                    Path(directory),
+                    state,
+                    settings,
+                    VideoInfo("x", "영상", "채널", 10, "https://youtu.be/x"),
+                )
+            self.assertEqual(generate.call_args.kwargs["provider"], "claude")
+            self.assertEqual(generate.call_args.kwargs["model"], "sonnet")
+            self.assertEqual(state["terminology"]["provider"], "claude")
+
+
+class ModelCatalogTests(unittest.TestCase):
+    def test_parses_listed_codex_models_in_priority_order(self) -> None:
+        models = _parse_codex_models(
+            [
+                {
+                    "slug": "gpt-b",
+                    "display_name": "GPT-B",
+                    "visibility": "list",
+                    "priority": 5,
+                    "default_reasoning_level": "medium",
+                    "supported_reasoning_levels": [{"effort": "low"}, {"effort": "medium"}],
+                },
+                {"slug": "hidden", "visibility": "hide", "priority": 1},
+                {"slug": "gpt-a", "display_name": "GPT-A", "visibility": "list", "priority": 1},
+            ]
+        )
+        self.assertEqual([model.value for model in models], ["gpt-a", "gpt-b"])
+        self.assertEqual(models[1].efforts, ("low", "medium"))
+        self.assertEqual(models[1].default_effort, "medium")
+
+    def test_parses_claude_models_without_the_default_alias(self) -> None:
+        models = _parse_claude_models(
+            [
+                {"value": "default", "displayName": "Default", "description": "Use Opus"},
+                {
+                    "value": "opus",
+                    "displayName": "Opus",
+                    "description": "Opus 5.5 · Best for everyday, complex tasks · $4/$20 per Mtok",
+                    "supportedEffortLevels": ["low", "medium", "high", "xhigh", "max"],
+                },
+                {"value": "haiku", "displayName": "Haiku", "description": "Haiku 4.5 · Fastest"},
+            ]
+        )
+        self.assertEqual([model.value for model in models], ["opus", "haiku"])
+        self.assertEqual(models[0].label, "Opus 5.5")
+        self.assertEqual(models[0].default_effort, "high")
+        self.assertEqual(models[1].efforts, ())
+
+    def test_falls_back_to_built_in_models_when_the_cli_fails(self) -> None:
+        for provider, client in ((OPENAI, "codex_client"), (CLAUDE, "claude_client")):
+            with patch(
+                f"lecture_scribe.ai_providers.{client}.fetch_model_catalog",
+                side_effect=FileNotFoundError("CLI 없음"),
+            ):
+                catalog = fetch_catalog(provider)
+            self.assertFalse(catalog.live)
+            self.assertIn("CLI 없음", catalog.detail)
+            self.assertTrue(catalog.models)
+
 
 class TimeRangeTests(unittest.TestCase):
     def test_parses_supported_timecode_formats(self) -> None:
@@ -613,6 +693,16 @@ class SettingsTests(unittest.TestCase):
             self.assertTrue(loaded.keep_video)
             self.assertTrue(loaded.auto_terminology)
             self.assertEqual(loaded.terminology_lecture_name, "운영체제")
+
+    def test_keeps_a_model_selection_per_provider(self) -> None:
+        settings = AppSettings()
+        settings.set_ai_selection("claude", "opus", "xhigh", "haiku")
+        settings.set_ai_selection("openai", "gpt-5.6-sol", "high", "gpt-5.6-luna")
+        self.assertEqual(settings.ai_selection("claude"), ("opus", "xhigh", "haiku"))
+        settings.ai_provider = "claude"
+        self.assertEqual(settings.ai_selection(), ("opus", "xhigh", "haiku"))
+        settings.ai_provider = "openai"
+        self.assertEqual(settings.ai_selection(), ("gpt-5.6-sol", "high", "gpt-5.6-luna"))
 
     def test_prompt_slots_persist_and_switch_active_prompt(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

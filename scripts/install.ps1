@@ -7,6 +7,7 @@ $ProjectRoot = Split-Path -Parent $PSScriptRoot
 $VenvRoot = Join-Path $ProjectRoot ".venv"
 $VenvPython = Join-Path $VenvRoot "Scripts\python.exe"
 $ToolsRoot = Join-Path $ProjectRoot "tools\codex-cli"
+$ClaudeToolsRoot = Join-Path $ProjectRoot "tools\claude-code"
 
 function Write-Step([string]$Message) {
     Write-Host ""
@@ -40,7 +41,7 @@ function Resolve-Python {
 }
 
 Write-Host "Lecture Scribe installer for Windows NVIDIA" -ForegroundColor White
-Write-Host "This installs Python packages, CUDA PyTorch, and Codex CLI locally." -ForegroundColor DarkGray
+Write-Host "This installs Python packages, CUDA PyTorch, Codex CLI, and Claude Code CLI locally." -ForegroundColor DarkGray
 
 $PythonExe = Resolve-Python
 if (-not $PythonExe) {
@@ -95,12 +96,17 @@ if (-not $Npm) {
     $Npm = Get-Command npm.exe -ErrorAction SilentlyContinue
 }
 if (-not $Npm) {
-    Write-Host "Node.js/npm was not found, so Codex CLI installation was skipped." -ForegroundColor Yellow
+    Write-Host "Node.js/npm was not found, so Codex CLI and Claude Code CLI installation was skipped." -ForegroundColor Yellow
     Write-Host "Transcription still works. Install Node.js LTS and rerun install.bat for AI notes or automatic terminology." -ForegroundColor Yellow
 } else {
     New-Item -ItemType Directory -Force -Path $ToolsRoot | Out-Null
     & $Npm.Source install --prefix $ToolsRoot --no-audit --no-fund "@openai/codex@latest"
     if ($LASTEXITCODE -ne 0) { throw "Codex CLI installation failed." }
+
+    Write-Step "Installing the latest official Claude Code CLI locally"
+    New-Item -ItemType Directory -Force -Path $ClaudeToolsRoot | Out-Null
+    & $Npm.Source install --prefix $ClaudeToolsRoot --no-audit --no-fund "@anthropic-ai/claude-code@latest"
+    if ($LASTEXITCODE -ne 0) { throw "Claude Code CLI installation failed." }
 }
 
 Write-Step "Verifying GPU and app dependencies"
@@ -121,5 +127,5 @@ if (-not $SkipDesktopShortcut) {
 }
 
 Write-Host ""
-Write-Host "Ready. Start with run.bat, then sign in from Tools > ChatGPT OAuth." -ForegroundColor Green
+Write-Host "Ready. Start with run.bat, then sign in to ChatGPT or Claude from Tools." -ForegroundColor Green
 Write-Host "The Whisper large-v3 model downloads on the first transcription." -ForegroundColor Yellow

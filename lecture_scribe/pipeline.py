@@ -14,7 +14,13 @@ from .audio_edit import (
     extract_waveform,
     render_edited_audio,
 )
-from .codex_client import auth_status, generate_notes, generate_transcription_terms
+from .ai_providers import (
+    PROVIDER_NAMES,
+    auth_status,
+    generate_notes,
+    generate_transcription_terms,
+    normalize_provider,
+)
 from .config import AppSettings, load_prompt
 from .local_media import LocalMediaCancelled, copy_local_media, resolve_local_media
 from .paths import safe_filename
@@ -77,11 +83,15 @@ def run_pipeline(
     )
     emit(1, "사전 점검", "현재 단계에 필요한 환경을 확인합니다.")
     if needs_auth:
-        status = auth_status()
+        provider = normalize_provider(settings.ai_provider)
+        status = auth_status(provider)
         if not status.available:
             raise RuntimeError(status.detail)
         if not status.logged_in:
-            raise RuntimeError("ChatGPT OAuth 로그인이 필요합니다. 도구 탭에서 로그인해주세요.")
+            raise RuntimeError(
+                f"{PROVIDER_NAMES[provider]} OAuth 로그인이 필요합니다. "
+                "연결과 업데이트 화면에서 로그인해주세요."
+            )
     if needs_transcriber:
         accelerator_name = verify_accelerator()
         if log:
@@ -382,11 +392,13 @@ def run_pipeline(
         emit(84, "AI 노트", "확인된 일반 전사문으로 필기 노트를 구성합니다.")
         transcript_for_prompt = transcript or _load_transcript_state(job_dir, state)
         notes_path = job_dir / "lecture_notes.md"
+        notes_model, reasoning_effort, _ = settings.ai_selection()
         generate_notes(
             prompt=_build_prompt(template, video, transcript_for_prompt),
             output_path=notes_path,
-            model=settings.codex_model,
-            reasoning_effort=settings.reasoning_effort,
+            provider=normalize_provider(settings.ai_provider),
+            model=notes_model,
+            reasoning_effort=reasoning_effort,
             log=log,
             cancel_event=cancel_event,
         )
@@ -489,12 +501,13 @@ def _ensure_state(state: dict, video: VideoInfo, settings: AppSettings) -> None:
         "whisper_model": settings.whisper_model,
         "language": settings.language,
         "beam_size": settings.beam_size,
-        "codex_model": settings.codex_model,
-        "reasoning_effort": settings.reasoning_effort,
+        "ai_provider": settings.ai_provider,
+        "notes_model": settings.ai_selection()[0],
+        "reasoning_effort": settings.ai_selection()[1],
         "keep_video": settings.keep_video,
         "auto_terminology": settings.auto_terminology,
         "terminology_lecture_name": settings.terminology_lecture_name,
-        "terminology_model": settings.terminology_model,
+        "terminology_model": settings.ai_selection()[2],
     }
 
 
@@ -528,10 +541,12 @@ def _prepare_transcription_terms(
                 log(f"저장된 전사 전문용어 {len(terms)}개를 재사용합니다: {saved_path.name}")
             return terms
 
+    terminology_model = settings.ai_selection()[2]
     terms = generate_transcription_terms(
         lecture_name,
+        provider=normalize_provider(settings.ai_provider),
         video_title=video.title,
-        model=settings.terminology_model,
+        model=terminology_model,
         reasoning_effort="medium",
         log=log,
         cancel_event=cancel_event,
@@ -540,7 +555,8 @@ def _prepare_transcription_terms(
     terms_path.write_text("\n".join(terms) + "\n", encoding="utf-8")
     state["terminology"] = {
         "lecture_name": lecture_name,
-        "model": settings.terminology_model,
+        "provider": normalize_provider(settings.ai_provider),
+        "model": terminology_model,
         "count": len(terms),
     }
     state.setdefault("artifacts", {})["transcription_terms"] = terms_path.name
@@ -703,11 +719,12 @@ def _write_metadata(
             "source": "edited_lecture.flac",
             "auto_terminology": settings.auto_terminology,
             "terminology_lecture_name": settings.terminology_lecture_name,
-            "terminology_model": settings.terminology_model,
+            "terminology_model": settings.ai_selection()[2],
         },
         "notes": {
-            "model": settings.codex_model,
-            "reasoning_effort": settings.reasoning_effort,
+            "provider": settings.ai_provider,
+            "model": settings.ai_selection()[0],
+            "reasoning_effort": settings.ai_selection()[1],
         },
         "video_output": {
             "enabled": settings.keep_video,

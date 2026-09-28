@@ -34,8 +34,10 @@ fi
 if command -v npm >/dev/null 2>&1; then
   mkdir -p tools/codex-cli
   npm install --prefix tools/codex-cli @openai/codex@latest
+  mkdir -p tools/claude-code
+  npm install --prefix tools/claude-code @anthropic-ai/claude-code@latest
 else
-  print "Node.js/npm을 찾지 못해 Codex CLI 설치를 건너뜁니다. 전사 기능은 그대로 사용할 수 있습니다."
+  print "Node.js/npm을 찾지 못해 Codex CLI와 Claude Code CLI 설치를 건너뜁니다. 전사 기능은 그대로 사용할 수 있습니다."
   print "AI 노트 기능도 쓰려면 'brew install node' 후 install.command를 다시 실행하세요."
 fi
 
