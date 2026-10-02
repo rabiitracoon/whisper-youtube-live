@@ -464,6 +464,14 @@ class MainWindow(QMainWindow):
         source.addWidget(self.time_range_panel)
         source.addWidget(range_help)
 
+        self.live_snapshot_check = QCheckBox("진행 중인 라이브는 지금까지 방송된 부분만 가져오기")
+        self.live_snapshot_check.setChecked(self.settings.live_snapshot)
+        self.live_snapshot_check.setToolTip(
+            "아직 끝나지 않은 YouTube 라이브 링크를 넣으면 방송 시작부터 지금 시점까지만 "
+            "받아 전사합니다. 끄면 방송이 끝난 뒤에만 가져올 수 있습니다."
+        )
+        source.addWidget(self.live_snapshot_check)
+
         folder_label = self._field_label("노트를 저장할 곳")
         self.folder_input = QLineEdit(self.settings.output_dir)
         self.folder_input.setAccessibleName("노트를 저장할 폴더")
@@ -1129,6 +1137,7 @@ class MainWindow(QMainWindow):
         self.settings.clip_end_seconds = clip_end
         self.settings.keep_audio = self.keep_audio_check.isChecked()
         self.settings.keep_video = self.keep_video_check.isChecked()
+        self.settings.live_snapshot = self.live_snapshot_check.isChecked()
         self.settings.auto_terminology = self.auto_terminology_check.isChecked()
         self.settings.beam_size = self.beam_spin.value()
         self.settings.cookie_browser = str(self.cookie_combo.currentData())

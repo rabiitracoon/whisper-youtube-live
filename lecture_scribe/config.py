@@ -21,6 +21,7 @@ class AppSettings:
     clip_end_seconds: float | None = None
     keep_audio: bool = False
     keep_video: bool = False
+    live_snapshot: bool = True
     auto_terminology: bool = False
     terminology_lecture_name: str = ""
     terminology_model: str = "gpt-5.6-luna"
