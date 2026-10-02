@@ -102,6 +102,17 @@ def run_pipeline(
     if is_youtube_url(source):
         emit(3, "영상 확인", "YouTube 영상 정보를 읽는 중입니다.")
         video = fetch_video_info(source, settings.cookie_browser, log)
+        if video.is_live:
+            if not settings.live_snapshot:
+                raise RuntimeError(
+                    "아직 진행 중인 라이브 방송입니다. ‘진행 중인 라이브는 지금까지 방송된 "
+                    "부분만 가져오기’를 켜거나 방송이 끝난 뒤 다시 시도해주세요."
+                )
+            if log:
+                log(
+                    "진행 중인 라이브 방송입니다. 지금까지 방송된 "
+                    f"약 {format_duration(video.duration)} 분량만 가져옵니다."
+                )
     else:
         emit(3, "파일 확인", "선택한 영상 또는 음성 파일을 읽는 중입니다.")
         local_media = resolve_local_media(source)
@@ -168,6 +179,7 @@ def run_pipeline(
                     ),
                     log=log,
                     cancel_event=cancel_event,
+                    live_snapshot=video.is_live,
                 )
         artifacts = {"original_audio": audio_path.name}
         if settings.keep_video:
@@ -189,6 +201,7 @@ def run_pipeline(
                         ),
                         log=log,
                         cancel_event=cancel_event,
+                        live_snapshot=video.is_live,
                     )
             artifacts["original_video"] = video_path.name
         _mark_stage(
@@ -466,6 +479,9 @@ def _resolve_job(
     root = root.expanduser().resolve()
     root.mkdir(parents=True, exist_ok=True)
     candidates = sorted(root.glob(f"*_{video.video_id}_*"), reverse=True)
+    if video.is_live and target_stage in {"all", "download"}:
+        # An earlier snapshot of a running broadcast is already out of date.
+        candidates = []
     for directory in candidates:
         state = _load_checkpoint(directory)
         if not state:

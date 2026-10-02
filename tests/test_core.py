@@ -55,6 +55,7 @@ from lecture_scribe.video_edit import (
 from lecture_scribe.youtube import (
     VideoInfo,
     _is_http_403,
+    _progress_hook,
     download_audio,
     download_video,
     format_duration,
@@ -153,6 +154,43 @@ class UrlTests(unittest.TestCase):
                 fallback_options["extractor_args"]["youtube"]["player_client"],
                 ["mweb"],
             )
+
+    def test_live_snapshot_downloads_from_start(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            downloaded = root / "video.mp4"
+            downloaded.write_bytes(b"audio")
+            leftover = root / "video.f140.mp4.part-Frag9.part"
+            leftover.write_bytes(b"partial")
+            instance = MagicMock()
+            instance.__enter__.return_value.extract_info.return_value = {
+                "requested_downloads": [{"filepath": str(downloaded)}]
+            }
+            with patch("yt_dlp.YoutubeDL", return_value=instance) as ydl:
+                result = download_audio(
+                    "https://youtu.be/video", "video", root, live_snapshot=True
+                )
+
+            self.assertEqual(result, downloaded.resolve())
+            self.assertTrue(ydl.call_args.args[0]["live_from_start"])
+            self.assertFalse(leftover.exists())
+
+    def test_live_snapshot_stops_at_the_live_edge_seen_at_start(self) -> None:
+        updates: list[tuple[float, str]] = []
+        hook = _progress_hook(
+            lambda ratio, detail: updates.append((ratio, detail)),
+            None,
+            "오디오",
+            live_snapshot=True,
+        )
+        base = {"status": "downloading", "filename": "a.mp4"}
+        hook({**base, "fragment_index": 1, "fragment_count": 4})
+        # The broadcast keeps growing, but the stop point must not move.
+        hook({**base, "fragment_index": 4, "fragment_count": 9})
+        self.assertEqual(updates[-1][0], 1.0)
+        with self.assertRaises(KeyboardInterrupt):
+            hook({**base, "fragment_index": 5, "fragment_count": 9})
+
 
 
 class LocalMediaTests(unittest.TestCase):

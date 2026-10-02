@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import shutil
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -22,6 +23,7 @@ class VideoInfo:
     channel: str
     duration: float
     webpage_url: str
+    is_live: bool = False
 
 
 def is_youtube_url(url: str) -> bool:
@@ -111,12 +113,18 @@ def fetch_video_info(
         data = ydl.extract_info(url.strip(), download=False)
     if not data or data.get("_type") == "playlist":
         raise ValueError("재생목록이 아닌 단일 YouTube 영상 링크를 입력해주세요.")
+    is_live = data.get("live_status") == "is_live" or bool(data.get("is_live"))
+    duration = float(data.get("duration") or 0)
+    if is_live and not duration and data.get("release_timestamp"):
+        # A running broadcast has no duration yet; use the time aired so far.
+        duration = max(0.0, time.time() - float(data["release_timestamp"]))
     return VideoInfo(
         video_id=str(data.get("id") or "video"),
         title=str(data.get("title") or "제목 없는 영상"),
         channel=str(data.get("channel") or data.get("uploader") or "알 수 없음"),
-        duration=float(data.get("duration") or 0),
+        duration=duration,
         webpage_url=str(data.get("webpage_url") or url.strip()),
+        is_live=is_live,
     )
 
 
@@ -128,6 +136,7 @@ def download_audio(
     progress: ProgressCallback | None = None,
     log: LogCallback | None = None,
     cancel_event: Event | None = None,
+    live_snapshot: bool = False,
 ) -> Path:
     from yt_dlp import YoutubeDL
     from yt_dlp.utils import DownloadError
@@ -143,10 +152,13 @@ def download_audio(
                     progress=progress,
                     cancel_event=cancel_event,
                     media_label="오디오",
+                    live_snapshot=live_snapshot,
                 )
             ],
         }
     )
+    if live_snapshot:
+        options["live_from_start"] = True
     try:
         with YoutubeDL(options) as ydl:
             data = ydl.extract_info(url.strip(), download=True)
@@ -178,6 +190,8 @@ def download_audio(
                 "그래도 실패하면 이 영상 또는 네트워크에는 PO Token Provider가 필요합니다."
             ) from fallback_exc
 
+    if live_snapshot:
+        _remove_fragment_leftovers(destination)
     candidates: list[Path] = []
     for item in (data or {}).get("requested_downloads", []):
         if item.get("filepath"):
@@ -199,6 +213,7 @@ def download_video(
     progress: ProgressCallback | None = None,
     log: LogCallback | None = None,
     cancel_event: Event | None = None,
+    live_snapshot: bool = False,
 ) -> Path:
     """Download a maximum-1080p video with audio and merge it as MP4."""
     from yt_dlp import YoutubeDL
@@ -216,10 +231,13 @@ def download_video(
                     progress=progress,
                     cancel_event=cancel_event,
                     media_label="영상",
+                    live_snapshot=live_snapshot,
                 )
             ],
         }
     )
+    if live_snapshot:
+        options["live_from_start"] = True
     try:
         with YoutubeDL(options) as ydl:
             data = ydl.extract_info(url.strip(), download=True)
@@ -248,6 +266,8 @@ def download_video(
                 "앱 설정에서 로그인된 브라우저 쿠키를 선택한 뒤 다시 시도하세요."
             ) from fallback_exc
 
+    if live_snapshot:
+        _remove_fragment_leftovers(destination)
     candidates: list[Path] = list(destination.glob("original_video.mp4"))
     for item in (data or {}).get("requested_downloads", []):
         if item.get("filepath"):
@@ -278,14 +298,45 @@ def _is_http_403(error: BaseException) -> bool:
     return False
 
 
+def _remove_fragment_leftovers(destination: Path) -> None:
+    """Delete the fragment that was in flight when a live snapshot stopped."""
+    for leftover in destination.glob("*.part-Frag*"):
+        try:
+            leftover.unlink()
+        except OSError:
+            pass
+
+
 def _progress_hook(
     progress: ProgressCallback | None,
     cancel_event: Event | None,
     media_label: str = "미디어",
+    live_snapshot: bool = False,
 ) -> Callable[[dict], None]:
+    # Fragment count of each stream when its download began, i.e. the live edge.
+    live_edges: dict[str, int] = {}
+
     def hook(data: dict) -> None:
         if cancel_event and cancel_event.is_set():
             raise DownloadCancelled("사용자가 다운로드를 취소했습니다.")
+        if live_snapshot and data.get("fragment_count"):
+            edge = live_edges.setdefault(
+                str(data.get("filename")), int(data["fragment_count"])
+            )
+            done = int(data.get("fragment_index") or 0)
+            if done > edge:
+                # yt-dlp follows a running broadcast until it ends. Its fragment
+                # downloader treats KeyboardInterrupt on a live stream as "stop
+                # here and finalize the file", which is the only supported way
+                # to end the download at the point that was live when we began.
+                raise KeyboardInterrupt
+            if progress and data.get("status") == "downloading":
+                speed = data.get("_speed_str", "").strip()
+                detail = f"라이브 {media_label} 다운로드 중 · 조각 {min(done, edge)}/{edge}"
+                if speed:
+                    detail += f" · {speed}"
+                progress(min(1.0, done / edge), detail)
+            return
         if not progress:
             return
         status = data.get("status")
