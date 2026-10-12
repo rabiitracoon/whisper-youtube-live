@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import sys
 
 from PySide6.QtCore import Qt
@@ -24,5 +25,21 @@ def main() -> int:
     return app.exec()
 
 
+def exit_now(code: int) -> None:
+    """End the process even if background work is still running.
+
+    Model downloads and loads, yt-dlp and ffmpeg cannot always be interrupted, and
+    the Hugging Face download pool is joined at interpreter shutdown, so a normal
+    exit could leave an invisible process running long after the window closed.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            if stream is not None:
+                stream.flush()
+        except (OSError, ValueError):
+            pass
+    os._exit(code)
+
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    exit_now(main())
