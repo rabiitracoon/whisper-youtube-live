@@ -26,6 +26,26 @@ from lecture_scribe.ai_providers import (
     _parse_transcription_terms,
     fetch_catalog,
 )
+from lecture_scribe.live_caption import (
+    SAMPLE_RATE,
+    LiveCaptioner,
+    LiveCaptionOptions,
+    LiveSource,
+    build_ffmpeg_command,
+    is_silent,
+    keep_segment,
+    quietest_cut,
+    resolve_live_source,
+    trailing_quiet_seconds,
+)
+from lecture_scribe.qwen_asr_engine import (
+    AlignedWord,
+    context_from_terms,
+    group_words,
+    is_qwen_model,
+    split_pieces,
+    transcribe_qwen,
+)
 from lecture_scribe.local_media import LocalMedia, copy_local_media, resolve_local_media
 from lecture_scribe.paths import safe_filename
 from lecture_scribe.pipeline import (
@@ -46,6 +66,7 @@ from lecture_scribe.transcription import (
     _build_initial_prompt,
     resolve_mlx_model,
     transcribe_audio,
+    transcribe_samples,
 )
 from lecture_scribe.video_edit import (
     _select_hardware_encoder,
@@ -821,6 +842,193 @@ class TranscriptQualityTests(unittest.TestCase):
         self.assertIn("실제 대학생", prompt)
         self.assertIn("타임스탬프", prompt)
         self.assertNotIn("{{url}}", prompt)
+
+
+class LiveCaptionTests(unittest.TestCase):
+    @staticmethod
+    def _tone(seconds: float, level: float = 0.3):
+        import numpy as np
+
+        count = int(SAMPLE_RATE * seconds)
+        return (level * np.sin(np.arange(count) * 2 * np.pi * 220 / SAMPLE_RATE)).astype("float32")
+
+    @staticmethod
+    def _silence(seconds: float):
+        import numpy as np
+
+        return np.zeros(int(SAMPLE_RATE * seconds), dtype="float32")
+
+    def test_ffmpeg_command_pulls_network_audio_without_loopback(self) -> None:
+        live = LiveSource("t", "https://example.com/a.m3u8", True, {"User-Agent": "UA"})
+        command = build_ffmpeg_command("ffmpeg", live)
+        self.assertIn("-headers", command)
+        self.assertNotIn("-re", command)
+        self.assertEqual(command[command.index("-ar") + 1], "16000")
+        recording = LiveSource("t", "/tmp/a.mp4", False)
+        command = build_ffmpeg_command("ffmpeg", recording)
+        self.assertIn("-re", command)
+        self.assertNotIn("-reconnect", command)
+
+    def test_resolve_rejects_missing_input(self) -> None:
+        with self.assertRaises(ValueError):
+            resolve_live_source("")
+        with self.assertRaises(ValueError):
+            resolve_live_source("not-a-link-or-file")
+        direct = resolve_live_source("https://cdn.example.com/live/index.m3u8?token=1")
+        self.assertTrue(direct.is_live)
+
+    def test_silence_helpers(self) -> None:
+        import numpy as np
+
+        audio = np.concatenate([self._tone(2.0), self._silence(0.8)])
+        self.assertTrue(is_silent(self._silence(3)))
+        self.assertFalse(is_silent(audio))
+        self.assertAlmostEqual(trailing_quiet_seconds(audio), 0.8, places=1)
+        gap = np.concatenate([self._tone(4.0), self._silence(0.5), self._tone(4.0)])
+        cut = quietest_cut(gap, search_seconds=6)
+        self.assertTrue(4.0 * SAMPLE_RATE <= cut <= 4.5 * SAMPLE_RATE)
+
+    def test_filters_hallucinated_and_repeated_lines(self) -> None:
+        self.assertFalse(keep_segment(TranscriptSegment(0, 1, "시청해주셔서 감사합니다.")))
+        self.assertFalse(keep_segment(TranscriptSegment(0, 1, "같은 문장"), "같은 문장."))
+        self.assertFalse(
+            keep_segment(TranscriptSegment(0, 1, "음", avg_logprob=-1.5, no_speech_probability=0.9))
+        )
+        self.assertTrue(keep_segment(TranscriptSegment(0, 1, "적분인자를 곱합니다")))
+
+    def test_captioner_finalizes_on_pause_and_offsets_times(self) -> None:
+        import numpy as np
+
+        calls: list[float] = []
+
+        def fake_transcribe(samples, **_kwargs):
+            calls.append(len(samples) / SAMPLE_RATE)
+            return [TranscriptSegment(0.5, len(samples) / SAMPLE_RATE - 0.5, f"문장 {len(calls)}")]
+
+        captions: list = []
+        partials: list[str] = []
+        captioner = LiveCaptioner(
+            LiveCaptionOptions(), captions.append, partials.append, transcribe=fake_transcribe
+        )
+        stream = np.concatenate([self._tone(3.5), self._silence(0.7), self._tone(14.0)])
+        for start in range(0, len(stream), SAMPLE_RATE // 10):
+            captioner.feed(stream[start:start + SAMPLE_RATE // 10])
+        captioner.flush()
+        self.assertGreaterEqual(len(captions), 3)
+        self.assertAlmostEqual(captions[0].start, 0.5, places=1)
+        # The second sentence starts after the first pause, not at zero.
+        self.assertGreater(captions[1].start, 3.5)
+        self.assertTrue(any(partials))
+        self.assertTrue(all(duration <= 12.01 for duration in calls))
+
+
+class QwenEngineTests(unittest.TestCase):
+    def test_model_names_and_context(self) -> None:
+        self.assertTrue(is_qwen_model("qwen3-asr-1.7b"))
+        self.assertFalse(is_qwen_model("large-v3"))
+        self.assertIn("미분방정식", context_from_terms(("미분방정식", " 고유값 ")))
+        self.assertEqual(context_from_terms(()), "")
+
+    def test_groups_aligned_korean_words_with_original_spacing(self) -> None:
+        text = "안녕하세요. 오늘은 미분을 배웁니다 다음은 적분입니다."
+        words = [
+            AlignedWord("안녕하세요", 0.0, 0.8),
+            AlignedWord("오늘은", 1.0, 1.4),
+            AlignedWord("미분을", 1.5, 1.9),
+            AlignedWord("배웁니다", 2.0, 2.6),
+            AlignedWord("다음은", 4.0, 4.4),
+            AlignedWord("적분입니다", 4.5, 5.2),
+        ]
+        segments = group_words(text, words)
+        self.assertEqual(
+            segments,
+            [
+                (0.0, 0.8, "안녕하세요."),
+                (1.0, 2.6, "오늘은 미분을 배웁니다"),
+                (4.0, 5.2, "다음은 적분입니다."),
+            ],
+        )
+
+    def test_groups_long_run_and_unmatched_words(self) -> None:
+        words = [AlignedWord(f"w{index}", index * 1.0, index * 1.0 + 0.9) for index in range(30)]
+        segments = group_words(" ".join(item.text for item in words), words, max_seconds=12)
+        self.assertGreater(len(segments), 1)
+        self.assertTrue(all(end - start <= 13 for start, end, _ in segments))
+        fallback = group_words("완전히 다른 글", [AlignedWord("없는말", 0, 1)])
+        self.assertEqual(fallback, [(0, 1, "없는말")])
+
+    def test_split_pieces_covers_audio(self) -> None:
+        import numpy as np
+
+        samples = np.ones(16_000 * 300, dtype="float32") * 0.2
+        samples[16_000 * 115: 16_000 * 116] = 0
+        pieces = split_pieces(samples, piece_seconds=120)
+        self.assertEqual(pieces[0][0], 0)
+        self.assertEqual(pieces[-1][1], len(samples))
+        self.assertTrue(115 * 16_000 <= pieces[0][1] <= 116 * 16_000)
+        for (_, end), (start, _) in zip(pieces, pieces[1:]):
+            self.assertEqual(end, start)
+
+    def test_mlx_backend_maps_result(self) -> None:
+        import numpy as np
+
+        fake = MagicMock()
+        fake.transcribe.return_value = SimpleNamespace(
+            text="안녕하세요. 반갑습니다.",
+            language="Korean",
+            segments=[
+                {"text": "안녕하세요", "start": 0.1, "end": 0.9},
+                {"text": "반갑습니다", "start": 1.1, "end": 1.8},
+            ],
+        )
+        with patch.dict(sys.modules, {"mlx_qwen3_asr": fake}), patch(
+            "lecture_scribe.qwen_asr_engine.platform.system", return_value="Darwin"
+        ), patch("lecture_scribe.qwen_asr_engine.platform.machine", return_value="arm64"), patch(
+            "lecture_scribe.qwen_asr_engine._MLX_ALIGNER", []
+        ):
+            segments, language = transcribe_qwen(
+                np.zeros(32_000, dtype="float32"), "qwen3-asr-1.7b", "ko", context="용어"
+            )
+        kwargs = fake.transcribe.call_args.kwargs
+        self.assertEqual(kwargs["model"], "Qwen/Qwen3-ASR-1.7B")
+        self.assertEqual(kwargs["language"], "Korean")
+        self.assertTrue(kwargs["return_timestamps"])
+        self.assertEqual(language, "ko")
+        self.assertEqual(segments, [(0.1, 0.9, "안녕하세요."), (1.1, 1.8, "반갑습니다.")])
+
+    def test_transcribe_audio_dispatches_to_qwen_with_clip_offsets(self) -> None:
+        import numpy as np
+
+        calls: list[int] = []
+
+        def fake_qwen(samples, model_name, language, context, timestamps=True, log=None):
+            calls.append(len(samples))
+            return [(0.5, 1.5, f"구간 {len(calls)}")], "ko"
+
+        video = VideoInfo("vid", "제목", "채널", 60, "https://youtu.be/vid")
+        with tempfile.TemporaryDirectory() as directory, patch(
+            "faster_whisper.audio.decode_audio",
+            return_value=np.full(16_000 * 60, 0.2, dtype="float32"),
+        ), patch("lecture_scribe.qwen_asr_engine.transcribe_qwen", side_effect=fake_qwen):
+            result = transcribe_audio(
+                Path(directory) / "audio.flac", Path(directory), video,
+                model_name="qwen3-asr-1.7b", language="ko",
+                clip_ranges=((10.0, 20.0), (30.0, 40.0)),
+            )
+        self.assertEqual(calls, [16_000 * 10, 16_000 * 10])
+        self.assertEqual([item.start for item in result.segments], [10.5, 30.5])
+        self.assertEqual(result.language, "ko")
+
+    def test_live_samples_skip_aligner(self) -> None:
+        import numpy as np
+
+        with patch(
+            "lecture_scribe.transcription.transcribe_qwen",
+            return_value=([(0.0, 2.0, "실시간 문장")], "ko"),
+        ) as fake:
+            segments = transcribe_samples(np.zeros(32_000, dtype="float32"), "qwen3-asr-1.7b", "ko")
+        self.assertFalse(fake.call_args.kwargs["timestamps"])
+        self.assertEqual(segments[0].text, "실시간 문장")
 
 
 if __name__ == "__main__":

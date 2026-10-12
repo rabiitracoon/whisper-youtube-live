@@ -90,6 +90,12 @@ Write-Step "Installing Lecture Scribe dependencies"
 & $VenvPython -m pip install --upgrade -r (Join-Path $ProjectRoot "requirements.txt")
 if ($LASTEXITCODE -ne 0) { throw "Python dependency installation failed." }
 
+Write-Step "Installing the optional Qwen3-ASR engine"
+& $VenvPython -m pip install -r (Join-Path $ProjectRoot "requirements-qwen-windows.txt")
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "Qwen3-ASR engine installation failed. Whisper transcription still works." -ForegroundColor Yellow
+}
+
 Write-Step "Installing the latest official Codex CLI locally"
 $Npm = Get-Command npm.cmd -ErrorAction SilentlyContinue
 if (-not $Npm) {

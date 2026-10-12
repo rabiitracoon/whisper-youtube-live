@@ -54,6 +54,7 @@ from ..updater import UpdateResult, current_version
 from ..local_media import resolve_local_media
 from ..youtube import is_youtube_url
 from .audio_editor import AudioEditorDialog
+from .live_caption_page import LiveCaptionPage
 from .workers import AuthWorker, ModelListWorker, PipelineWorker, UpdateWorker
 
 
@@ -106,6 +107,14 @@ class MainWindow(QMainWindow):
         self.tabs = QStackedWidget()
         self.tabs.setObjectName("PageStack")
         self.tabs.addWidget(self._build_transcribe_tab())
+        self.live_page = LiveCaptionPage(
+            self.settings,
+            self._card,
+            self._field_label,
+            self._launch_worker,
+            cookie_browser=lambda: str(self.cookie_combo.currentData() or "none"),
+        )
+        self.tabs.addWidget(self.live_page)
         self.tabs.addWidget(self._build_prompt_tab())
         self.tabs.addWidget(self._build_tools_tab())
         workspace_layout.addWidget(self.tabs, 1)
@@ -199,6 +208,7 @@ class MainWindow(QMainWindow):
         for index, (label, icon_name) in enumerate(
             [
                 ("새 강의 노트", "nav-new.svg"),
+                ("실시간 자막", "nav-live.svg"),
                 ("노트 작성 방식", "nav-note.svg"),
                 ("연결과 업데이트", "nav-connect.svg"),
             ]
@@ -260,6 +270,7 @@ class MainWindow(QMainWindow):
     def _switch_page(self, index: int) -> None:
         page_copy = [
             ("새 강의 노트", "영상 링크 하나로 공부하기 좋은 노트를 만드세요."),
+            ("실시간 자막", "듣고 있는 라이브 수업을 자막으로 따라가세요. 놓친 부분은 기록에서 다시 읽을 수 있어요."),
             ("노트 작성 방식", "내가 공부하는 방식에 맞게 노트의 말투와 구성을 정하세요."),
             ("연결과 업데이트", "컴퓨터와 AI 서비스 연결 상태를 한곳에서 관리하세요."),
         ]
@@ -522,7 +533,10 @@ class MainWindow(QMainWindow):
         grid.setHorizontalSpacing(16)
         grid.setVerticalSpacing(10)
         self.whisper_combo = QComboBox()
-        self.whisper_combo.addItems(["large-v3", "large-v2", "medium"])
+        self.whisper_combo.addItems(["large-v3", "large-v2", "medium", "qwen3-asr-1.7b"])
+        self.whisper_combo.setToolTip(
+            "large-v3: Whisper 기본값 · qwen3-asr-1.7b: Qwen3-ASR 엔진(선택, 첫 실행 시 약 5GB 다운로드)"
+        )
         self.whisper_combo.setCurrentText(self.settings.whisper_model)
         self.language_combo = QComboBox()
         for label, code in [
@@ -1627,6 +1641,16 @@ class MainWindow(QMainWindow):
                 self._cancel_pipeline()
             event.ignore()
             return
+        if self.live_page.running:
+            answer = QMessageBox.question(
+                self,
+                "실시간 자막 진행 중",
+                "실시간 자막을 멈추고 창을 닫을까요? 지금까지의 자막은 저장되어 있습니다.",
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                event.ignore()
+                return
+        self.live_page.shutdown()
         for thread, worker in list(self._background):
             cancel = getattr(worker, "cancel", None)
             if callable(cancel):

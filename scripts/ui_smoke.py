@@ -21,7 +21,7 @@ def main() -> int:
     if len(sys.argv) not in {2, 3}:
         print(
             "Usage: python scripts/ui_smoke.py <screenshot.png> "
-            "[--review|--advanced|--prompt|--tools|--compact]"
+            "[--review|--advanced|--live|--prompt|--tools|--compact]"
         )
         return 2
     app = QApplication([])
@@ -50,10 +50,12 @@ def main() -> int:
         window.review_preview.setFocus()
     elif len(sys.argv) == 3 and sys.argv[2] == "--advanced":
         window.advanced_mode_check.setChecked(True)
-    elif len(sys.argv) == 3 and sys.argv[2] == "--prompt":
+    elif len(sys.argv) == 3 and sys.argv[2] == "--live":
         window._switch_page(1)
-    elif len(sys.argv) == 3 and sys.argv[2] == "--tools":
+    elif len(sys.argv) == 3 and sys.argv[2] == "--prompt":
         window._switch_page(2)
+    elif len(sys.argv) == 3 and sys.argv[2] == "--tools":
+        window._switch_page(3)
     elif len(sys.argv) == 3 and sys.argv[2] == "--compact":
         window.resize(1080, 720)
 
@@ -66,12 +68,12 @@ def main() -> int:
             for scroll_area in window.findChildren(QScrollArea):
                 scroll_area.ensureWidgetVisible(window.advanced_panel, 20, 20)
             app.processEvents()
-        elif len(sys.argv) == 3 and sys.argv[2] in {"--prompt", "--tools"}:
+        elif len(sys.argv) == 3 and sys.argv[2] in {"--live", "--prompt", "--tools"}:
             app.processEvents()
         elif len(sys.argv) == 3 and sys.argv[2] == "--compact":
             app.processEvents()
-        if len(sys.argv) == 3 and sys.argv[2] in {"--prompt", "--tools"}:
-            expected = 1 if sys.argv[2] == "--prompt" else 2
+        if len(sys.argv) == 3 and sys.argv[2] in {"--live", "--prompt", "--tools"}:
+            expected = {"--live": 1, "--prompt": 2, "--tools": 3}[sys.argv[2]]
             if window.tabs.currentIndex() != expected or not window.nav_buttons[expected].isChecked():
                 print("Sidebar navigation state did not match the visible page.", file=sys.stderr)
                 app.exit(4)

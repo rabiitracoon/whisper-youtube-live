@@ -36,6 +36,11 @@ class AppSettings:
     prompt_path: str = str(PROMPT_PATH)
     prompt_slots: list[dict[str, str]] = field(default_factory=list)
     active_prompt_slot_id: str = ""
+    live_url: str = ""
+    live_model: str = "large-v3-turbo"
+    live_language: str = "ko"
+    live_terms: str = ""
+    live_font_size: int = 17
 
     @classmethod
     def load(cls, path: Path = SETTINGS_PATH) -> "AppSettings":
