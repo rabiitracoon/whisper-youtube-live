@@ -20,6 +20,7 @@ from threading import Event
 
 import numpy as np
 
+from .model_download import DownloadCancelled, DownloadProgress, prefetch_model
 from .paths import safe_filename
 from .transcription import TranscriptSegment, _build_initial_prompt, _srt_time, transcribe_samples
 from .youtube import _base_options
@@ -446,9 +447,12 @@ def run_live_captions(
     cancel_event: Event,
     cookie_browser: str = "none",
     log: LogCallback | None = None,
+    on_progress: Callable[[bool, float | None], None] | None = None,
 ) -> Path:
     """Caption ``source_text`` until cancelled or the broadcast ends.
 
+    ``on_progress(visible, fraction)`` drives a progress bar while the model is
+    prepared; ``fraction`` is None when the amount of work is unknown.
     Returns the folder holding the saved caption files.
     """
     import imageio_ffmpeg
@@ -468,13 +472,30 @@ def run_live_captions(
     log(f"자막 저장 위치: {writer_holder[0].folder}")
     ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
 
-    on_status(f"Whisper {options.model_name} 모델 준비 중 · 첫 실행은 다운로드가 필요합니다")
-    # Warm the model up before audio starts piling up.
-    captioner.transcribe(
-        np.zeros(SAMPLE_RATE, dtype=np.float32), model_name=options.model_name,
-        language=options.language, compute_type=options.compute_type,
-        beam_size=options.beam_size, log=log,
-    )
+    show_progress = on_progress or (lambda _visible, _fraction: None)
+
+    def report_download(progress: DownloadProgress) -> None:
+        on_status(progress.message)
+        show_progress(True, progress.fraction)
+
+    try:
+        on_status(f"{options.model_name} 모델 확인 중")
+        show_progress(True, None)
+        try:
+            prefetch_model(options.model_name, report_download, cancel_event, log)
+        except DownloadCancelled:
+            on_status("모델 다운로드를 취소했습니다 · 받은 부분은 다음에 이어받습니다")
+            return writer_holder[0].folder
+        on_status(f"{options.model_name} 모델을 메모리에 올리는 중 · 처음에는 1분 정도 걸릴 수 있습니다")
+        show_progress(True, None)
+        # Warm the model up before audio starts piling up.
+        captioner.transcribe(
+            np.zeros(SAMPLE_RATE, dtype=np.float32), model_name=options.model_name,
+            language=options.language, compute_type=options.compute_type,
+            beam_size=options.beam_size, log=log,
+        )
+    finally:
+        show_progress(False, None)
 
     reconnects = 0
     captioner.started_at = datetime.now()

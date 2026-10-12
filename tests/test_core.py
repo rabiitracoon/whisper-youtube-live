@@ -38,6 +38,7 @@ from lecture_scribe.live_caption import (
     resolve_live_source,
     trailing_quiet_seconds,
 )
+from lecture_scribe import model_download
 from lecture_scribe.qwen_asr_engine import (
     AlignedWord,
     context_from_terms,
@@ -920,6 +921,83 @@ class LiveCaptionTests(unittest.TestCase):
         self.assertGreater(captions[1].start, 3.5)
         self.assertTrue(any(partials))
         self.assertTrue(all(duration <= 12.01 for duration in calls))
+
+
+class ModelDownloadTests(unittest.TestCase):
+    def test_message_shows_percent_speed_and_eta(self) -> None:
+        progress = model_download.DownloadProgress(
+            "Whisper large-v3-turbo 모델", 400 * 1024**2, 1600 * 1024**2, 20 * 1024**2, 0.0
+        )
+        self.assertAlmostEqual(progress.fraction or 0, 0.25)
+        for expected in ("25%", "400.0 MB / 1.6 GB", "20.0 MB/초", "남은 시간 약 1분 0초"):
+            self.assertIn(expected, progress.message)
+
+    def test_message_flags_a_stalled_download(self) -> None:
+        stalled = model_download.DownloadProgress("모델", 10, 100, 0.0, 30.0)
+        self.assertIn("30초째 진행이 없습니다", stalled.message)
+        unknown = model_download.DownloadProgress("모델", 2048, None, 0.0, 0.0)
+        self.assertIsNone(unknown.fraction)
+        self.assertIn("2.0 KB 받음", unknown.message)
+
+    def test_download_reports_growth_and_surfaces_failures(self) -> None:
+        import time
+
+        repo = model_download.ModelRepo("org/model", "테스트 모델")
+        with tempfile.TemporaryDirectory() as folder:
+            blobs = Path(folder)
+
+            def fake_download(*_args, **_kwargs):
+                for _ in range(4):
+                    with (blobs / "x.incomplete").open("ab") as handle:
+                        handle.write(b"a" * 250)
+                    time.sleep(0.15)
+
+            seen: list[model_download.DownloadProgress] = []
+            with (
+                patch.object(model_download, "is_cached", return_value=False),
+                patch.object(model_download, "remote_size", return_value=1000),
+                patch.object(model_download, "_blob_dir", return_value=blobs),
+                patch.object(model_download, "POLL_SECONDS", 0.05),
+                patch("huggingface_hub.snapshot_download", fake_download),
+            ):
+                self.assertTrue(model_download.download_repo(repo, seen.append))
+            self.assertEqual(seen[-1].fraction, 1.0)
+            self.assertTrue(any(0 < (item.fraction or 0) < 1 for item in seen))
+
+            def broken_download(*_args, **_kwargs):
+                raise OSError("offline")
+
+            with (
+                patch.object(model_download, "is_cached", return_value=False),
+                patch.object(model_download, "remote_size", return_value=None),
+                patch.object(model_download, "_blob_dir", return_value=blobs),
+                patch.object(model_download, "POLL_SECONDS", 0.05),
+                patch("huggingface_hub.snapshot_download", broken_download),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "offline"):
+                    model_download.download_repo(repo, seen.append)
+
+    def test_cancel_stops_waiting_for_the_download(self) -> None:
+        import time
+        from threading import Event
+
+        repo = model_download.ModelRepo("org/model", "테스트 모델")
+        cancel = Event()
+        cancel.set()
+        with tempfile.TemporaryDirectory() as folder:
+            with (
+                patch.object(model_download, "is_cached", return_value=False),
+                patch.object(model_download, "remote_size", return_value=None),
+                patch.object(model_download, "_blob_dir", return_value=Path(folder)),
+                patch("huggingface_hub.snapshot_download", lambda *a, **k: time.sleep(0.5)),
+            ):
+                with self.assertRaises(model_download.DownloadCancelled):
+                    model_download.download_repo(repo, lambda _p: None, cancel)
+
+    def test_cached_model_skips_download(self) -> None:
+        repo = model_download.ModelRepo("org/model", "테스트 모델")
+        with patch.object(model_download, "is_cached", return_value=True):
+            self.assertFalse(model_download.download_repo(repo, lambda _p: self.fail("no progress")))
 
 
 class QwenEngineTests(unittest.TestCase):
