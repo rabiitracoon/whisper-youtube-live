@@ -944,7 +944,9 @@ class ModelDownloadTests(unittest.TestCase):
 
         repo = model_download.ModelRepo("org/model", "테스트 모델")
         with tempfile.TemporaryDirectory() as folder:
-            blobs = Path(folder)
+            repo_dir = Path(folder)
+            blobs = repo_dir / "blobs"
+            blobs.mkdir()
 
             def fake_download(*_args, **_kwargs):
                 for _ in range(4):
@@ -956,7 +958,7 @@ class ModelDownloadTests(unittest.TestCase):
             with (
                 patch.object(model_download, "is_cached", return_value=False),
                 patch.object(model_download, "remote_size", return_value=1000),
-                patch.object(model_download, "_blob_dir", return_value=blobs),
+                patch.object(model_download, "_repo_dir", return_value=repo_dir),
                 patch.object(model_download, "POLL_SECONDS", 0.05),
                 patch("huggingface_hub.snapshot_download", fake_download),
             ):
@@ -970,7 +972,7 @@ class ModelDownloadTests(unittest.TestCase):
             with (
                 patch.object(model_download, "is_cached", return_value=False),
                 patch.object(model_download, "remote_size", return_value=None),
-                patch.object(model_download, "_blob_dir", return_value=blobs),
+                patch.object(model_download, "_repo_dir", return_value=repo_dir),
                 patch.object(model_download, "POLL_SECONDS", 0.05),
                 patch("huggingface_hub.snapshot_download", broken_download),
             ):
@@ -988,7 +990,7 @@ class ModelDownloadTests(unittest.TestCase):
             with (
                 patch.object(model_download, "is_cached", return_value=False),
                 patch.object(model_download, "remote_size", return_value=None),
-                patch.object(model_download, "_blob_dir", return_value=Path(folder)),
+                patch.object(model_download, "_repo_dir", return_value=Path(folder)),
                 patch("huggingface_hub.snapshot_download", lambda *a, **k: time.sleep(0.5)),
             ):
                 with self.assertRaises(model_download.DownloadCancelled):

@@ -5,7 +5,9 @@ constructor, so a first run looks frozen for minutes. Fetching the files up fron
 lets the UI show bytes, percent, speed and whether data is still arriving.
 
 Progress is measured from the files growing inside the Hugging Face cache rather
-than from tqdm hooks, so it works the same with plain HTTP and with ``hf_xet``.
+than from tqdm hooks. The ``hf_xet`` transfer backend is switched off because it
+keeps the data in memory and writes the file in one burst at the end, which makes
+a large download look stuck at 0% until it suddenly finishes.
 """
 
 from __future__ import annotations
@@ -134,24 +136,37 @@ def _faster_whisper_repo(model_name: str) -> str | None:
     return _MODELS.get(model_name)
 
 
-def _blob_dir(repo_id: str) -> Path:
+def _repo_dir(repo_id: str) -> Path:
     from huggingface_hub.constants import HF_HUB_CACHE
     from huggingface_hub.file_download import repo_folder_name
 
-    return Path(HF_HUB_CACHE) / repo_folder_name(repo_id=repo_id, repo_type="model") / "blobs"
+    return Path(HF_HUB_CACHE) / repo_folder_name(repo_id=repo_id, repo_type="model")
 
 
-def _directory_bytes(path: Path) -> int:
+def _downloaded_bytes(repo_dir: Path) -> int:
+    """Bytes of this repo already on disk, finished or still downloading."""
     total = 0
     try:
-        for entry in os.scandir(path):
+        names = os.listdir(repo_dir / "blobs")
+    except OSError:
+        names = []
+    for name in names:
+        # os.path.getsize, not DirEntry.stat(): on Windows the directory entry keeps
+        # a stale size while another handle is still writing the file.
+        try:
+            total += os.path.getsize(repo_dir / "blobs" / name)
+        except OSError:
+            continue
+    # Without symlink support (typical on Windows) a finished file leaves blobs/
+    # and sits in snapshots/ as a regular file instead.
+    for root, _dirs, files in os.walk(repo_dir / "snapshots"):
+        for name in files:
+            path = os.path.join(root, name)
             try:
-                if entry.is_file():
-                    total += entry.stat().st_size
+                if not os.path.islink(path):
+                    total += os.path.getsize(path)
             except OSError:
                 continue
-    except OSError:
-        return 0
     return total
 
 
@@ -213,15 +228,16 @@ def download_repo(
     log: LogCallback | None = None,
 ) -> bool:
     """Make sure ``repo`` is in the local cache. Returns True when a download happened."""
-    from huggingface_hub import snapshot_download
+    from huggingface_hub import constants, snapshot_download
     from huggingface_hub.utils import disable_progress_bars
 
     if is_cached(repo):
         return False
     # A windowed app has no console for the library's own tqdm bars.
     disable_progress_bars()
+    constants.HF_HUB_DISABLE_XET = True
     total = remote_size(repo)
-    blobs = _blob_dir(repo.repo_id)
+    repo_dir = _repo_dir(repo.repo_id)
     if log:
         size_text = format_bytes(total) if total else "크기 미확인"
         log(f"{repo.label} 다운로드를 시작합니다 ({size_text}). 이어받기를 지원합니다.")
@@ -237,12 +253,12 @@ def download_repo(
     thread = threading.Thread(target=fetch, name="model-download", daemon=True)
     thread.start()
     meter = _SpeedMeter()
-    started_with = _directory_bytes(blobs)
+    started_with = _downloaded_bytes(repo_dir)
     while thread.is_alive():
         if cancel_event is not None and cancel_event.is_set():
             # The partial files stay in the cache and resume on the next run.
             raise DownloadCancelled("모델 다운로드를 취소했습니다.")
-        done = _directory_bytes(blobs)
+        done = _downloaded_bytes(repo_dir)
         if total:
             done = min(done, total)
         speed, stalled = meter.update(done)
@@ -253,7 +269,7 @@ def download_repo(
             f"{repo.label}을 다운로드하지 못했습니다. 인터넷 연결을 확인하고 다시 시도해주세요. "
             f"(받던 파일은 보존되어 이어받습니다)\n{outcome[0]}"
         ) from outcome[0]
-    final = _directory_bytes(blobs)
+    final = _downloaded_bytes(repo_dir)
     on_progress(DownloadProgress(repo.label, total or final, total or final, 0.0, 0.0))
     if log:
         log(f"{repo.label} 다운로드를 마쳤습니다 ({format_bytes(max(final - started_with, 0))} 받음).")
