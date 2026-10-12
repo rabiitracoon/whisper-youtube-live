@@ -16,6 +16,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QMessageBox,
     QPlainTextEdit,
+    QProgressBar,
     QPushButton,
     QSizeGrip,
     QSizePolicy,
@@ -200,6 +201,12 @@ class LiveCaptionPage(QWidget):
         grid.addWidget(self.terms_input, 3, 0, 1, 2)
         setup.addLayout(grid)
 
+        self.model_progress = QProgressBar()
+        self.model_progress.setAccessibleName("모델 준비 진행률")
+        self.model_progress.setTextVisible(True)
+        self.model_progress.setVisible(False)
+        setup.addWidget(self.model_progress)
+
         action_row = QHBoxLayout()
         self.status_label = QLabel("대기 중")
         self.status_label.setObjectName("HelperText")
@@ -301,6 +308,7 @@ class LiveCaptionPage(QWidget):
         worker.caption.connect(self._on_caption)
         worker.partial.connect(self._on_partial)
         worker.status.connect(self.status_label.setText)
+        worker.progress.connect(self._on_model_progress)
         worker.log.connect(self._on_log)
         worker.result.connect(self._on_result)
         worker.error.connect(self._on_error)
@@ -330,6 +338,17 @@ class LiveCaptionPage(QWidget):
             self.jump_button.setText(f"최신 자막으로 ↓ ({self._unseen})")
             self.jump_button.setVisible(True)
         self.overlay.add_line(caption.text)
+
+    def _on_model_progress(self, visible: bool, fraction: object) -> None:
+        bar = self.model_progress
+        bar.setVisible(visible)
+        if fraction is None:
+            # Busy indicator: the amount of work is unknown (checking, loading into memory).
+            bar.setRange(0, 0)
+        else:
+            bar.setRange(0, 1000)
+            bar.setValue(int(float(fraction) * 1000))
+            bar.setFormat(f"{float(fraction) * 100:.0f}%")
 
     def _on_partial(self, text: str) -> None:
         self.partial_label.setText(f"듣는 중… {text}" if text else "")
@@ -362,6 +381,7 @@ class LiveCaptionPage(QWidget):
 
     def _on_finished(self) -> None:
         self.worker = None
+        self.model_progress.setVisible(False)
         self.partial_label.setText("")
         self.overlay.set_partial("")
         self.start_button.setEnabled(True)

@@ -182,6 +182,7 @@ class LiveCaptionWorker(QObject):
     caption = Signal(object)
     partial = Signal(str)
     status = Signal(str)
+    progress = Signal(bool, object)
     log = Signal(str)
     result = Signal(object)
     error = Signal(str)
@@ -214,6 +215,7 @@ class LiveCaptionWorker(QObject):
                 cancel_event=self.cancel_event,
                 cookie_browser=self.cookie_browser,
                 log=self.log.emit,
+                on_progress=self.progress.emit,
             )
             self.result.emit(folder)
         except Exception as exc:  # UI boundary: present an actionable error to the user.
