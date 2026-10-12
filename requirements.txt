@@ -6,6 +6,8 @@ mlx-qwen3-asr>=0.4.4,<0.5; sys_platform == "darwin" and platform_machine == "arm
 soynlp>=0.0.493; sys_platform == "darwin" and platform_machine == "arm64"
 # Windows에서는 CUDA 전사, macOS에서는 자동 쉬는 시간 찾기의 Silero VAD에 사용합니다.
 faster-whisper>=1.2.1,<2
+# av 19부터 faster-whisper가 쓰는 open(metadata_errors=)가 없어져 전사가 실패하므로 18 이하로 고정합니다.
+av>=11,<19
 yt-dlp[default]>=2026.1.1
 imageio-ffmpeg>=0.6,<1
 packaging>=24.2
