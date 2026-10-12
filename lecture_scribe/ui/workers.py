@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 from threading import Event
 
 from PySide6.QtCore import QObject, Signal, Slot
@@ -8,6 +9,7 @@ from ..audio_edit import WaveformCancelled
 from ..ai_providers import auth_status, fetch_catalog, login, logout
 from ..codex_client import CodexCancelled
 from ..config import AppSettings
+from ..live_caption import LiveCaptionOptions, run_live_captions
 from ..local_media import LocalMediaCancelled
 from ..pipeline import PipelineCancelled, run_pipeline
 from ..transcription import TranscriptionCancelled
@@ -174,3 +176,50 @@ class UpdateWorker(QObject):
             self.error.emit(str(exc))
         finally:
             self.finished.emit()
+
+
+class LiveCaptionWorker(QObject):
+    caption = Signal(object)
+    partial = Signal(str)
+    status = Signal(str)
+    log = Signal(str)
+    result = Signal(object)
+    error = Signal(str)
+    finished = Signal()
+
+    def __init__(
+        self,
+        source: str,
+        options: LiveCaptionOptions,
+        output_root: Path,
+        cookie_browser: str,
+    ):
+        super().__init__()
+        self.source = source
+        self.options = options
+        self.output_root = output_root
+        self.cookie_browser = cookie_browser
+        self.cancel_event = Event()
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            folder = run_live_captions(
+                self.source,
+                self.options,
+                self.output_root,
+                on_caption=self.caption.emit,
+                on_partial=self.partial.emit,
+                on_status=self.status.emit,
+                cancel_event=self.cancel_event,
+                cookie_browser=self.cookie_browser,
+                log=self.log.emit,
+            )
+            self.result.emit(folder)
+        except Exception as exc:  # UI boundary: present an actionable error to the user.
+            self.error.emit(str(exc))
+        finally:
+            self.finished.emit()
+
+    def cancel(self) -> None:
+        self.cancel_event.set()

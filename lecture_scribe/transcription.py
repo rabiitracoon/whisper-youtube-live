@@ -11,12 +11,19 @@ from typing import Callable, Iterable
 
 from .audio_edit import map_edited_time_to_original
 from .paths import PROJECT_ROOT
+from .qwen_asr_engine import (
+    context_from_terms,
+    is_qwen_model,
+    transcribe_qwen,
+    transcribe_qwen_long,
+)
 from .youtube import VideoInfo, format_duration
 
 
 ProgressCallback = Callable[[float, str], None]
 LogCallback = Callable[[str], None]
 MLX_MODEL_ALIASES = {
+    "large-v3-turbo": "mlx-community/whisper-large-v3-turbo",
     "large-v3": "mlx-community/whisper-large-v3-mlx",
     "large-v2": "mlx-community/whisper-large-v2-mlx",
     "medium": "mlx-community/whisper-medium-mlx",
@@ -238,7 +245,12 @@ def transcribe_audio(
         range_text = f"{len(normalized_ranges)}개 강의 구간"
     initial_prompt = _build_initial_prompt(prompt_terms)
 
-    if backend == "mlx":
+    if is_qwen_model(model_name):
+        raw_segments, full_duration, detected_language, probability = _transcribe_qwen(
+            audio_path, model_name, language, prompt_terms, clip_timestamps,
+            range_text, progress, log, cancel_event,
+        )
+    elif backend == "mlx":
         raw_segments, full_duration, detected_language, probability = _transcribe_mlx(
             audio_path, video, model_name, language, compute_type, clip_timestamps,
             initial_prompt, range_text, timestamp_map, vad_filter, log,
@@ -351,6 +363,56 @@ def _transcribe_mlx(
     return raw_segments, duration, str(result.get("language", language)), 1.0
 
 
+def _transcribe_qwen(
+    audio_path: Path, model_name: str, language: str, prompt_terms: tuple[str, ...],
+    clip_timestamps: str | list[float], range_text: str,
+    progress: ProgressCallback | None, log: LogCallback | None,
+    cancel_event: Event | None,
+) -> tuple[list[dict], float, str, float]:
+    from faster_whisper.audio import decode_audio
+
+    if log:
+        log(f"Qwen3-ASR({model_name})로 전사를 시작합니다. 구간: {range_text}")
+        log("첫 실행에는 음성 인식 모델과 타임스탬프 정렬 모델 다운로드가 필요합니다.")
+    samples = decode_audio(str(audio_path), sampling_rate=16_000)
+    duration = len(samples) / 16_000
+    if isinstance(clip_timestamps, str):
+        ranges = [(0.0, duration)]
+    else:
+        values = list(clip_timestamps)
+        if len(values) % 2:
+            values.append(duration)
+        ranges = [
+            (start, min(end, duration))
+            for start, end in zip(values[0::2], values[1::2])
+            if start < duration and min(end, duration) > start
+        ]
+    total = max(1.0, sum(end - start for start, end in ranges))
+    context = context_from_terms(prompt_terms)
+    segments: list[dict] = []
+    languages: list[str] = []
+    done = 0.0
+    for start, end in ranges:
+        piece = samples[int(start * 16_000): int(end * 16_000)]
+
+        def report(position: float, _length: float, base: float = done) -> None:
+            if progress:
+                progress(min(1.0, (base + position) / total), f"전사 중 · {format_duration(start + position)}")
+
+        piece_segments, detected = transcribe_qwen_long(
+            piece, model_name, language, context, progress=report, log=log,
+            cancel_event=cancel_event, is_cancelled_error=TranscriptionCancelled,
+        )
+        languages.append(detected)
+        segments.extend(
+            {"start": start + seg_start, "end": start + seg_end, "text": text}
+            for seg_start, seg_end, text in piece_segments
+        )
+        done += end - start
+    detected_language = languages[0] if languages else language
+    return segments, duration, detected_language, 0.0
+
+
 def _transcribe_cuda(
     audio_path: Path, video: VideoInfo, model_name: str, language: str,
     compute_type: str, beam_size: int, clip_timestamps: str | list[float],
@@ -380,6 +442,65 @@ def _transcribe_cuda(
         str(getattr(info, "language", language)),
         float(getattr(info, "language_probability", 0.0) or 0.0),
     )
+
+
+def transcribe_samples(
+    samples: object,
+    model_name: str,
+    language: str = "auto",
+    initial_prompt: str | None = None,
+    compute_type: str = "float16",
+    beam_size: int = 1,
+    log: LogCallback | None = None,
+) -> list[TranscriptSegment]:
+    """Transcribe an in-memory 16 kHz mono float32 buffer (used by live captions)."""
+    backend = runtime_backend()
+    if backend == "unsupported":
+        verify_accelerator()
+    if is_qwen_model(model_name):
+        # Live chunks are short, so one segment per chunk is enough and the
+        # forced aligner is skipped to keep latency low.
+        segments, _language = transcribe_qwen(
+            samples, model_name, language, context=initial_prompt or "",
+            timestamps=False, log=log,
+        )
+        return [TranscriptSegment(start=s, end=e, text=text) for s, e, text in segments]
+    if backend == "mlx":
+        import mlx_whisper
+
+        result = mlx_whisper.transcribe(
+            samples, path_or_hf_repo=resolve_mlx_model(model_name), task="transcribe",
+            language=None if language == "auto" else language, temperature=0.0,
+            condition_on_previous_text=False, initial_prompt=initial_prompt,
+            word_timestamps=False, fp16=compute_type != "float32", verbose=None,
+        )
+        raw_segments: Iterable[object] = result.get("segments", [])
+    else:
+        model = _get_cuda_model(model_name, compute_type, log)
+        raw_segments, _info = model.transcribe(
+            samples, task="transcribe",
+            language=None if language == "auto" else language,
+            beam_size=beam_size, temperature=0.0,
+            condition_on_previous_text=False, initial_prompt=initial_prompt,
+            vad_filter=False, word_timestamps=False,
+        )
+    segments: list[TranscriptSegment] = []
+    for raw in raw_segments:
+        text = str(_raw_value(raw, "text", "")).strip()
+        if not text:
+            continue
+        start = float(_raw_value(raw, "start", 0))
+        segments.append(
+            TranscriptSegment(
+                start=start,
+                end=float(_raw_value(raw, "end", start)),
+                text=text,
+                avg_logprob=_optional_float(raw, "avg_logprob"),
+                no_speech_probability=_optional_float(raw, "no_speech_prob"),
+                compression_ratio=_optional_float(raw, "compression_ratio"),
+            )
+        )
+    return segments
 
 
 def _build_initial_prompt(prompt_terms: tuple[str, ...], limit: int = 600) -> str | None:
