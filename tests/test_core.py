@@ -1001,6 +1001,31 @@ class ModelDownloadTests(unittest.TestCase):
         with patch.object(model_download, "is_cached", return_value=True):
             self.assertFalse(model_download.download_repo(repo, lambda _p: self.fail("no progress")))
 
+    def test_partial_snapshot_is_not_cached(self) -> None:
+        repo = model_download.ModelRepo("org/model", "테스트 모델")
+        with tempfile.TemporaryDirectory() as folder:
+            repo_dir = Path(folder)
+            snapshot = repo_dir / "snapshots" / "abc"
+            snapshot.mkdir(parents=True)
+            (snapshot / "config.json").write_text("{}")
+            (repo_dir / "blobs").mkdir()
+            (repo_dir / "blobs" / "model.incomplete").write_bytes(b"")
+            expected = {"config.json": 2, "model.bin": 100}
+            with (
+                patch("huggingface_hub.snapshot_download", return_value=str(snapshot)),
+                patch.object(model_download, "_repo_dir", return_value=repo_dir),
+            ):
+                with patch.object(model_download, "remote_files", return_value=expected):
+                    self.assertFalse(model_download.is_cached(repo))
+                with patch.object(model_download, "remote_files", return_value=None):
+                    self.assertFalse(model_download.is_cached(repo))
+                (snapshot / "model.bin").write_bytes(b"x")
+                (repo_dir / "blobs" / "model.incomplete").unlink()
+                with patch.object(model_download, "remote_files", return_value=expected):
+                    self.assertTrue(model_download.is_cached(repo))
+                with patch.object(model_download, "remote_files", return_value=None):
+                    self.assertTrue(model_download.is_cached(repo))
+
 
 class QwenEngineTests(unittest.TestCase):
     def test_model_names_and_context(self) -> None:

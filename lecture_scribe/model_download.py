@@ -174,29 +174,44 @@ def is_cached(repo: ModelRepo) -> bool:
     from huggingface_hub import snapshot_download
 
     try:
-        snapshot_download(
+        folder = Path(snapshot_download(
             repo.repo_id, allow_patterns=repo.allow_patterns, local_files_only=True
-        )
-    except Exception:  # not (completely) in the cache
+        ))
+    except Exception:  # nothing of this repo in the cache
         return False
-    return True
+    # local_files_only only proves the snapshot folder exists. An interrupted
+    # download leaves it holding the small files while model.bin is missing.
+    expected = remote_files(repo)
+    if expected is not None:
+        return all((folder / name).is_file() for name in expected)
+    # Offline: trust the snapshot unless a download was left unfinished.
+    blobs = _repo_dir(repo.repo_id) / "blobs"
+    if blobs.is_dir() and any(blobs.glob("*.incomplete")):
+        return False
+    return any(path.is_file() for path in folder.rglob("*"))
 
 
-def remote_size(repo: ModelRepo) -> int | None:
-    """Total bytes still to fetch for ``repo``, or None when the hub cannot be asked."""
+def remote_files(repo: ModelRepo) -> dict[str, int] | None:
+    """Sizes of the files ``repo`` needs, or None when the hub cannot be asked."""
     try:
         from huggingface_hub import HfApi
 
         info = HfApi().model_info(repo.repo_id, files_metadata=True)
-        patterns = repo.allow_patterns
-        total = 0
-        for sibling in info.siblings or []:
-            if patterns and not any(fnmatch.fnmatch(sibling.rfilename, p) for p in patterns):
-                continue
-            total += int(sibling.size or 0)
     except Exception:
         return None
-    return total or None
+    patterns = repo.allow_patterns
+    files = {
+        sibling.rfilename: int(sibling.size or 0)
+        for sibling in info.siblings or []
+        if not patterns or any(fnmatch.fnmatch(sibling.rfilename, p) for p in patterns)
+    }
+    return files or None
+
+
+def remote_size(repo: ModelRepo) -> int | None:
+    """Total bytes still to fetch for ``repo``, or None when the hub cannot be asked."""
+    files = remote_files(repo)
+    return sum(files.values()) or None if files else None
 
 
 class _SpeedMeter:
