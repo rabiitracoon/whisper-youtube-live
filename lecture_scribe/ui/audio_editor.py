@@ -2,9 +2,10 @@ from __future__ import annotations
 
 from threading import Event
 
-from PySide6.QtCore import QObject, QRegularExpression, QRectF, QSize, QThread, Qt, QUrl, Signal, Slot
+from PySide6.QtCore import QObject, QRect, QRegularExpression, QRectF, QSize, QThread, Qt, QUrl, Signal, Slot
 from PySide6.QtGui import (
     QColor,
+    QGuiApplication,
     QCloseEvent,
     QKeyEvent,
     QMouseEvent,
@@ -42,6 +43,8 @@ from ..audio_edit import (
 )
 from ..time_range import parse_timecode
 from ..youtube import format_duration
+from .editor_style import EDITOR_STYLE
+from .theme import COLORS
 
 
 def _precise_time(seconds: float) -> str:
@@ -66,20 +69,29 @@ class TimelineScrollArea(QScrollArea):
         )
         self.setToolTip("휠: 확대/축소 · Shift + 휠: 좌우 탐색")
 
-    @staticmethod
-    def _axis_delta(point) -> int:
-        return point.y() if point.y() else point.x()
+    def resizeEvent(self, event) -> None:  # noqa: N802
+        super().resizeEvent(event)
+        widget = self.widget()
+        if widget is not None:
+            # The waveform is as wide as the zoom asks, but always as tall as the view.
+            widget.setFixedHeight(max(widget.minimumHeight(), self.viewport().height()))
 
     def wheelEvent(self, event: QWheelEvent) -> None:  # noqa: N802
-        angle_delta = self._axis_delta(event.angleDelta())
-        pixel_delta = self._axis_delta(event.pixelDelta())
+        angle = event.angleDelta()
+        pixel = event.pixelDelta()
+        horizontal_only = abs(angle.x()) > abs(angle.y()) or (
+            not angle.y() and abs(pixel.x()) > abs(pixel.y())
+        )
+        angle_delta = angle.x() if horizontal_only else angle.y()
+        pixel_delta = pixel.x() if horizontal_only else pixel.y()
         if not angle_delta and not pixel_delta:
             event.ignore()
             return
 
-        if event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
+        if horizontal_only or event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
             # A mouse-wheel notch moves roughly one comfortable viewport slice.
-            # Precision touchpads keep their native pixel distance.
+            # Precision touchpads keep their native pixel distance. Horizontal
+            # trackpad swipes pan instead of zooming.
             distance = pixel_delta if pixel_delta else round(angle_delta * 1.5)
             bar = self.horizontalScrollBar()
             bar.setValue(bar.value() - distance)
@@ -127,6 +139,26 @@ class AutoDetectionWorker(QObject):
             self.failed.emit(str(exc))
 
 
+
+
+_TICK_STEPS = (1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 900, 1800, 3600)
+
+
+def _tick_label(seconds: float) -> str:
+    total = int(round(seconds))
+    hours, remainder = divmod(total, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours}:{minutes:02d}:{secs:02d}"
+    return f"{minutes}:{secs:02d}"
+
+
+def _rgba(key: str, alpha: int) -> QColor:
+    color = QColor(COLORS[key])
+    color.setAlpha(alpha)
+    return color
+
+
 class WaveformWidget(QWidget):
     seek_requested = Signal(float)
     razor_requested = Signal(float)
@@ -144,7 +176,7 @@ class WaveformWidget(QWidget):
         self.exclusions: tuple[tuple[float, float], ...] = ()
         self.selected_segment: int | None = None
         self.playhead = request.range_start
-        self.setMinimumHeight(286)
+        self.setMinimumHeight(220)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setCursor(Qt.CursorShape.CrossCursor)
         self.setAccessibleName("강의 오디오 파형 편집 영역")
@@ -184,70 +216,129 @@ class WaveformWidget(QWidget):
         self.setFixedWidth(max(900, width))
         self.updateGeometry()
 
+    def _tick_interval(self) -> float:
+        if self.duration <= 0 or self.width() <= 0:
+            return _TICK_STEPS[-1]
+        pixels_per_second = self.width() / self.duration
+        for step in _TICK_STEPS:
+            if step * pixels_per_second >= 110:
+                return step
+        return _TICK_STEPS[-1]
+
     def paintEvent(self, event) -> None:  # noqa: N802
         painter = QPainter(self)
-        painter.fillRect(self.rect(), QColor("#10121A"))
-        center = self.height() / 2
-        painter.setPen(QPen(QColor("#303443"), 1))
-        painter.drawLine(0, int(center), self.width(), int(center))
-
+        painter.fillRect(event.rect(), QColor(COLORS["editor_bg"]))
+        width, height = self.width(), self.height()
+        if width <= 0 or height <= 0:
+            return
+        ruler = 26
+        wave_height = height - ruler
+        center = wave_height / 2
         visible = event.rect().adjusted(-2, 0, 2, 0)
-        painter.setPen(QPen(QColor("#8073F1"), 1))
-        for x in range(max(0, visible.left()), min(self.width(), visible.right() + 1)):
-            peak_index = min(
-                len(self.peaks) - 1,
-                int(x / max(1, self.width() - 1) * len(self.peaks)),
-            )
-            amplitude = self.peaks[peak_index] * (self.height() * 0.37)
-            painter.drawLine(x, int(center - amplitude), x, int(center + amplitude))
+        left_x = max(0, visible.left())
+        right_x = min(width, visible.right() + 1)
 
-        self._shade(painter, 0.0, self.range_start, QColor(5, 6, 10, 165))
-        self._shade(painter, self.range_end, self.duration, QColor(5, 6, 10, 165))
-        for start, end in self.exclusions:
-            self._shade(painter, start, end, QColor(205, 54, 63, 112))
+        painter.setPen(QPen(QColor(COLORS["editor_border"]), 1))
+        painter.drawLine(left_x, int(center), right_x, int(center))
 
-        segments = self.segments
-        if self.selected_segment is not None and self.selected_segment < len(segments):
-            start, end = segments[self.selected_segment]
-            left, right = self._x_for_seconds(start), self._x_for_seconds(end)
-            painter.setPen(QPen(QColor("#42D7D0"), 3))
-            painter.drawRect(QRectF(left + 1, 1, max(2, right - left - 2), self.height() - 3))
+        if self.peaks and self.duration > 0:
+            painter.setPen(QPen(QColor(COLORS["wave_kept"]), 1))
+            count = len(self.peaks)
+            for x in range(left_x, right_x):
+                index = min(count - 1, int(x / max(1, width - 1) * count))
+                amplitude = max(1.0, self.peaks[index] * (wave_height * 0.42))
+                painter.drawLine(x, int(center - amplitude), x, int(center + amplitude))
 
-        painter.setPen(QPen(QColor("#F2A84B"), 2))
-        for cut in self.cuts:
-            x = self._x_for_seconds(cut)
-            painter.drawLine(x, 0, x, self.height())
+        if self.duration > 0:
+            dim = _rgba("editor_bg", 190)
+            self._shade(painter, 0.0, self.range_start, dim)
+            self._shade(painter, self.range_end, self.duration, dim)
+            for start, end in self.exclusions:
+                self._shade(painter, start, end, _rgba("wave_removed", 70), wave_height)
+            for start, end in self.exclusions:
+                left, right = self._x_for_seconds(start), self._x_for_seconds(end)
+                painter.fillRect(
+                    QRectF(left, 0, max(1, right - left), 3), _rgba("wave_removed", 220)
+                )
 
-        playhead_x = self._x_for_seconds(self.playhead)
-        painter.setPen(QPen(QColor("#FF5DA2"), 2))
-        painter.drawLine(playhead_x, 0, playhead_x, self.height())
+            segments = self.segments
+            if self.selected_segment is not None and self.selected_segment < len(segments):
+                start, end = segments[self.selected_segment]
+                left, right = self._x_for_seconds(start), self._x_for_seconds(end)
+                painter.fillRect(
+                    QRectF(left, 0, max(1, right - left), wave_height),
+                    _rgba("wave_selection", 38),
+                )
+                painter.setPen(QPen(QColor(COLORS["wave_selection"]), 2))
+                painter.drawRect(
+                    QRectF(left + 1, 1, max(2, right - left - 2), wave_height - 3)
+                )
 
-        painter.setPen(QPen(QColor("#9298A8"), 1))
-        label_count = max(2, min(12, self.width() // 180))
-        for index in range(label_count + 1):
-            seconds = self.duration * index / label_count
+            painter.setPen(QPen(QColor(COLORS["wave_cut"]), 2))
+            for cut in self.cuts:
+                x = self._x_for_seconds(cut)
+                if left_x - 2 <= x <= right_x + 2:
+                    painter.drawLine(x, 0, x, height)
+
+            self._draw_ruler(painter, left_x, right_x, height, ruler)
+
+            playhead_x = self._x_for_seconds(self.playhead)
+            painter.setPen(QPen(QColor(COLORS["wave_playhead"]), 2))
+            painter.drawLine(playhead_x, 0, playhead_x, height)
+
+    def _draw_ruler(
+        self, painter: QPainter, left_x: int, right_x: int, height: int, ruler: int
+    ) -> None:
+        painter.setPen(QPen(QColor(COLORS["editor_border"]), 1))
+        painter.drawLine(left_x, height - ruler, right_x, height - ruler)
+        interval = self._tick_interval()
+        pixels_per_second = self.width() / self.duration
+        first = max(0, int((left_x - 90) / pixels_per_second / interval))
+        last = int((right_x + 2) / pixels_per_second / interval) + 1
+        font = painter.font()
+        font.setPixelSize(11)
+        painter.setFont(font)
+        for index in range(first, last + 1):
+            seconds = index * interval
+            if seconds > self.duration:
+                break
             x = self._x_for_seconds(seconds)
-            painter.drawLine(x, self.height() - 18, x, self.height())
+            painter.setPen(QPen(QColor(COLORS["editor_text_tertiary"]), 1))
+            painter.drawLine(x, height - ruler, x, height - ruler + 6)
+            painter.setPen(QPen(QColor(COLORS["editor_text_secondary"]), 1))
             painter.drawText(
-                QRectF(x + 4, self.height() - 23, 88, 20), format_duration(seconds)
+                QRectF(x + 4, height - ruler + 5, 90, ruler - 6),
+                Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                _tick_label(seconds),
             )
 
-    def _shade(self, painter: QPainter, start: float, end: float, color: QColor) -> None:
+    def _shade(
+        self,
+        painter: QPainter,
+        start: float,
+        end: float,
+        color: QColor,
+        height: float | None = None,
+    ) -> None:
         if end <= start:
             return
         left = self._x_for_seconds(start)
         right = self._x_for_seconds(end)
         painter.fillRect(
-            QRectF(left, 0, max(1, right - left), self.height()), color
+            QRectF(left, 0, max(1, right - left), height or self.height()), color
         )
 
     def _seconds_for_x(self, x: float) -> float:
+        if self.width() <= 0:
+            return self.range_start
         return max(
             self.range_start,
             min(self.range_end, x / max(1, self.width()) * self.duration),
         )
 
     def _x_for_seconds(self, seconds: float) -> int:
+        if self.duration <= 0:
+            return 0
         return round(
             max(0.0, min(seconds, self.duration)) / self.duration * self.width()
         )
@@ -282,13 +373,36 @@ class WaveformWidget(QWidget):
         super().keyPressEvent(event)
 
 
+def _card(tone: str | None = None) -> tuple[QFrame, QVBoxLayout]:
+    frame = QFrame()
+    frame.setObjectName("EditorCard")
+    if tone:
+        frame.setProperty("tone", tone)
+    layout = QVBoxLayout(frame)
+    layout.setContentsMargins(14, 12, 14, 14)
+    layout.setSpacing(8)
+    return frame, layout
+
+
+def _label(text: str, name: str | None = None, wrap: bool = False) -> QLabel:
+    label = QLabel(text)
+    if name:
+        label.setObjectName(name)
+    label.setWordWrap(wrap)
+    return label
+
+
 class AudioEditorDialog(QDialog):
+    NO_SELECTION_TEXT = "파형에서 두 곳을 잘라 구간을 만들고, 구간 선택 도구로 눌러보세요."
+
     def __init__(self, request: AudioEditRequest, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.request = request
         self.cuts: tuple[float, ...] = ()
         self.exclusions: tuple[tuple[float, float], ...] = ()
         self.selected_segment: int | None = None
+        self._cut_history: list[float] = []
+        self._skip_discard_confirm = False
         self._preview_stop_ms: int | None = None
         self._media_ready = False
         self._pending_seek_seconds = request.range_start
@@ -305,9 +419,15 @@ class AudioEditorDialog(QDialog):
         self._auto_candidates: tuple[tuple[float, float], ...] = ()
         self._close_after_detection = False
         self.setObjectName("EditorDialog")
+        self.setStyleSheet(EDITOR_STYLE)
         self.setWindowTitle("Lecture Scribe — 쉬는 시간 정리")
-        self.setMinimumSize(1150, 720)
-        self.resize(1380, 860)
+        screen = self.screen() or QGuiApplication.primaryScreen()
+        available = screen.availableGeometry() if screen else QRect(0, 0, 1366, 728)
+        self.setMinimumSize(min(960, available.width()), min(620, available.height()))
+        self.resize(
+            min(1380, int(available.width() * 0.92)),
+            min(860, int(available.height() * 0.92)),
+        )
         self.setModal(True)
 
         self.audio_output = QAudioOutput(self)
@@ -320,36 +440,27 @@ class AudioEditorDialog(QDialog):
         self.player.errorOccurred.connect(self._on_player_error)
 
         root = QVBoxLayout(self)
-        root.setContentsMargins(28, 24, 28, 22)
-        root.setSpacing(15)
-        header = QFrame()
-        header.setObjectName("EditorHeader")
-        header_layout = QVBoxLayout(header)
-        header_layout.setContentsMargins(20, 17, 20, 17)
-        header_layout.setSpacing(5)
-        kicker = QLabel("2단계 · 수업이 아닌 구간 빼기")
-        kicker.setObjectName("Eyebrow")
-        title = QLabel("쉬는 시간과 음악을 정리해주세요")
-        title.setObjectName("EditorTitle")
-        helper = QLabel(
-            "먼저 자동으로 찾아본 뒤, 소리를 재생해 맞는지 확인하세요. 직접 고칠 때는 파형을 클릭해 자를 수 있어요."
+        root.setContentsMargins(24, 18, 24, 18)
+        root.setSpacing(12)
+
+        header = QVBoxLayout()
+        header.setSpacing(2)
+        header.addWidget(_label("2단계 · 수업이 아닌 구간 빼기", "EditorKicker"))
+        header.addWidget(_label("쉬는 시간과 음악을 정리해주세요", "EditorTitle"))
+        header.addWidget(
+            _label("자동으로 찾은 뒤 소리를 들어 확인하고, 필요하면 파형을 클릭해 직접 자르세요.", "HelperText")
         )
-        helper.setObjectName("HelperText")
-        helper.setWordWrap(True)
-        header_layout.addWidget(kicker)
-        header_layout.addWidget(title)
-        header_layout.addWidget(helper)
-        root.addWidget(header)
+        root.addLayout(header)
 
         work_area = QHBoxLayout()
         work_area.setSpacing(14)
         timeline_column = QVBoxLayout()
-        timeline_column.setSpacing(12)
+        timeline_column.setSpacing(10)
 
         toolbar = QFrame()
         toolbar.setObjectName("Toolbar")
         toolbar_layout = QHBoxLayout(toolbar)
-        toolbar_layout.setContentsMargins(8, 7, 8, 7)
+        toolbar_layout.setContentsMargins(8, 6, 8, 6)
         toolbar_layout.setSpacing(6)
         self.tool_group = QButtonGroup(self)
         self.tool_group.setExclusive(True)
@@ -366,16 +477,16 @@ class AudioEditorDialog(QDialog):
             toolbar_layout.addWidget(button)
             if tool == "razor":
                 button.setChecked(True)
-        toolbar_layout.addSpacing(12)
-        toolbar_layout.addWidget(QLabel("현재 위치"))
+        toolbar_layout.addSpacing(10)
         self.time_input = QLineEdit(_precise_time(request.range_start))
         self.time_input.setAccessibleName("정확한 현재 위치 시간")
         self.time_input.setPlaceholderText("HH:MM:SS.mmm")
         pattern = QRegularExpression(r"\d{1,3}:[0-5]\d:[0-5]\d(?:\.\d{1,3})?")
         self.time_input.setValidator(QRegularExpressionValidator(pattern, self.time_input))
-        self.time_input.setMaximumWidth(150)
+        self.time_input.setFixedWidth(128)
         self.time_input.returnPressed.connect(self._seek_from_input)
         move_button = QPushButton("찾기")
+        move_button.setObjectName("GhostButton")
         move_button.clicked.connect(self._seek_from_input)
         cut_at_head = QPushButton("여기서 자르기")
         cut_at_head.clicked.connect(lambda: self._add_cut(self.waveform.playhead))
@@ -383,18 +494,19 @@ class AudioEditorDialog(QDialog):
         toolbar_layout.addWidget(move_button)
         toolbar_layout.addWidget(cut_at_head)
         toolbar_layout.addStretch(1)
-        timeline_column.addWidget(toolbar)
-
-        zoom_row = QHBoxLayout()
-        zoom_row.addWidget(QLabel("파형 확대 · 마우스 휠: 확대/축소 · Shift + 휠: 좌우 이동"))
+        zoom_caption = _label("확대", "MutedLabel")
         self.zoom_slider = QSlider(Qt.Orientation.Horizontal)
         self.zoom_slider.setRange(1, 24)
         self.zoom_slider.setValue(5)
+        self.zoom_slider.setFixedWidth(130)
         self.zoom_slider.setAccessibleName("파형 확대 배율")
-        self.zoom_label = QLabel("5×")
-        zoom_row.addWidget(self.zoom_slider, 1)
-        zoom_row.addWidget(self.zoom_label)
-        timeline_column.addLayout(zoom_row)
+        self.zoom_slider.setToolTip("휠: 확대/축소 · Shift + 휠: 좌우 이동")
+        self.zoom_label = _label("5×", "MutedLabel")
+        self.zoom_label.setMinimumWidth(26)
+        toolbar_layout.addWidget(zoom_caption)
+        toolbar_layout.addWidget(self.zoom_slider)
+        toolbar_layout.addWidget(self.zoom_label)
+        timeline_column.addWidget(toolbar)
 
         self.waveform = WaveformWidget(request)
         self.waveform.set_zoom_width(1000 * self.zoom_slider.value())
@@ -410,12 +522,33 @@ class AudioEditorDialog(QDialog):
         self.waveform_scroll.setVerticalScrollBarPolicy(
             Qt.ScrollBarPolicy.ScrollBarAlwaysOff
         )
-        self.waveform_scroll.setMinimumHeight(322)
+        self.waveform_scroll.setMinimumHeight(250)
         self.waveform_scroll.zoom_requested.connect(self._zoom_from_wheel)
         timeline_column.addWidget(self.waveform_scroll, 1)
 
+        legend = QHBoxLayout()
+        legend.setSpacing(6)
+        for key, text in [
+            ("wave_cut", "자른 곳"),
+            ("wave_removed", "글에서 뺄 구간"),
+            ("wave_selection", "선택한 구간"),
+            ("wave_playhead", "현재 위치"),
+        ]:
+            dot = QLabel()
+            dot.setFixedSize(10, 10)
+            dot.setStyleSheet(f"background: {COLORS[key]}; border-radius: 5px;")
+            legend.addWidget(dot)
+            legend.addWidget(_label(text, "MutedLabel"))
+            legend.addSpacing(10)
+        legend.addStretch(1)
+        legend.addWidget(_label("휠: 확대/축소 · Shift + 휠: 좌우 이동", "MutedLabel"))
+        timeline_column.addLayout(legend)
+
         playback_row = QHBoxLayout()
+        playback_row.setSpacing(8)
         self.play_button = QPushButton("재생")
+        self.play_button.setObjectName("AccentButton")
+        self.play_button.setMinimumWidth(92)
         self.play_button.setEnabled(False)
         self.play_button.clicked.connect(self._toggle_playback)
         self.play_clip_button = QPushButton("선택 구간 듣기")
@@ -427,12 +560,12 @@ class AudioEditorDialog(QDialog):
             f"{_precise_time(request.range_start)} / {format_duration(request.duration)}"
         )
         self.position_label.setObjectName("TimeLabel")
-        self.audio_status_label = QLabel("소리 준비 중")
-        self.audio_status_label.setObjectName("HelperText")
+        self.audio_status_label = _label("소리 준비 중", "MutedLabel")
+        self.audio_status_label.setMinimumWidth(110)
         volume = QSlider(Qt.Orientation.Horizontal)
         volume.setRange(0, 100)
         volume.setValue(80)
-        volume.setMaximumWidth(120)
+        volume.setFixedWidth(110)
         volume.setAccessibleName("미리듣기 음량")
         volume.valueChanged.connect(
             lambda value: self.audio_output.setVolume(value / 100)
@@ -440,26 +573,24 @@ class AudioEditorDialog(QDialog):
         playback_row.addWidget(self.play_button)
         playback_row.addWidget(self.play_clip_button)
         playback_row.addWidget(stop_button)
+        playback_row.addSpacing(8)
         playback_row.addWidget(self.position_label)
-        playback_row.addWidget(self.audio_status_label)
         playback_row.addStretch(1)
-        playback_row.addWidget(QLabel("음량"))
+        playback_row.addWidget(self.audio_status_label)
+        playback_row.addSpacing(8)
+        playback_row.addWidget(_label("음량", "MutedLabel"))
         playback_row.addWidget(volume)
         timeline_column.addLayout(playback_row)
 
-        clip_panel = QFrame()
-        clip_panel.setObjectName("EditorPanel")
-        clip_panel.setMinimumWidth(320)
-        clip_panel.setMaximumWidth(365)
-        clip_layout = QVBoxLayout(clip_panel)
-        clip_layout.setContentsMargins(17, 17, 17, 17)
-        clip_layout.setSpacing(11)
-        inspector_kicker = QLabel("SMART CUT")
-        inspector_kicker.setObjectName("InspectorKicker")
-        inspector_title = QLabel("자동으로 먼저 찾아볼까요?")
-        inspector_title.setObjectName("InspectorTitle")
-        clip_layout.addWidget(inspector_kicker)
-        clip_layout.addWidget(inspector_title)
+        # Inspector column (scrolls when the window is short).
+        inspector = QWidget()
+        clip_layout = QVBoxLayout(inspector)
+        clip_layout.setContentsMargins(0, 0, 6, 0)
+        clip_layout.setSpacing(10)
+
+        auto_card, auto_layout = _card()
+        auto_layout.addWidget(_label("자동으로 찾기", "CardKicker"))
+        auto_layout.addWidget(_label("쉬는 시간과 음악을 먼저 찾아볼까요?", "CardTitle", True))
         self.auto_detect_button = QPushButton("쉬는 시간 자동 찾기")
         self.auto_detect_button.setObjectName("AccentButton")
         self.auto_detect_button.setAccessibleName("음악과 쉬는 시간 자동 찾기")
@@ -467,67 +598,81 @@ class AudioEditorDialog(QDialog):
             "수업 전과 종료 후의 음악, 중간의 긴 쉬는 시간을 찾아 제외할 구간으로 표시합니다."
         )
         self.auto_detect_button.clicked.connect(self._toggle_auto_detection)
-        self.undo_auto_button = QPushButton("자동 찾기 되돌리기")
+        self.undo_auto_button = QPushButton("되돌리기")
+        self.undo_auto_button.setObjectName("GhostButton")
+        self.undo_auto_button.setToolTip("자동 찾기 전 상태로 되돌립니다.")
         self.undo_auto_button.setEnabled(False)
         self.undo_auto_button.clicked.connect(self._undo_auto_detection)
-        self.auto_status_label = QLabel(
-            "수업 전·쉬는 시간·종료 후의 음악을 찾아요. 표시된 구간은 꼭 한 번 들어보세요."
+        self.auto_status_label = _label(
+            "표시된 구간은 꼭 한 번 들어보고 확인하세요.", "HelperText", True
         )
-        self.auto_status_label.setObjectName("HelperText")
-        self.auto_status_label.setWordWrap(True)
         self.auto_progress = QProgressBar()
         self.auto_progress.setRange(0, 100)
-        self.auto_progress.setMaximumWidth(180)
         self.auto_progress.setAccessibleName("쉬는 시간 자동 찾기 진행률")
         self.auto_progress.setVisible(False)
         auto_buttons = QHBoxLayout()
-        auto_buttons.setSpacing(7)
+        auto_buttons.setSpacing(6)
         auto_buttons.addWidget(self.auto_detect_button, 1)
         auto_buttons.addWidget(self.undo_auto_button)
-        clip_layout.addLayout(auto_buttons)
-        clip_layout.addWidget(self.auto_status_label)
-        clip_layout.addWidget(self.auto_progress)
+        auto_layout.addLayout(auto_buttons)
+        auto_layout.addWidget(self.auto_progress)
+        auto_layout.addWidget(self.auto_status_label)
+        clip_layout.addWidget(auto_card)
 
-        selection_title = QLabel("선택한 구간")
-        selection_title.setObjectName("InspectorSection")
-        clip_layout.addSpacing(4)
-        clip_layout.addWidget(selection_title)
-        self.clip_label = QLabel("파형을 두 번 잘라 빼고 싶은 구간을 만든 뒤 선택하세요.")
-        self.clip_label.setWordWrap(True)
+        sel_card, sel_layout = _card()
+        sel_layout.addWidget(_label("선택한 구간", "CardKicker"))
+        self.clip_label = _label(self.NO_SELECTION_TEXT, "HelperText", True)
         self.toggle_exclusion_button = QPushButton("선택 구간 빼기")
         self.toggle_exclusion_button.setEnabled(False)
         self.toggle_exclusion_button.clicked.connect(self._toggle_selected_exclusion)
-        undo_cut_button = QPushButton("마지막 자르기 취소")
-        undo_cut_button.clicked.connect(self._undo_cut)
-        clip_layout.addWidget(self.clip_label)
-        clip_actions = QHBoxLayout()
-        clip_actions.setSpacing(7)
-        clip_actions.addWidget(undo_cut_button)
-        clip_actions.addWidget(self.toggle_exclusion_button, 1)
-        clip_layout.addLayout(clip_actions)
-        excluded_title = QLabel("글에서 빠질 구간")
-        excluded_title.setObjectName("InspectorSection")
-        clip_layout.addSpacing(4)
-        clip_layout.addWidget(excluded_title)
+        self.undo_cut_button = QPushButton("마지막 자르기 취소")
+        self.undo_cut_button.setObjectName("GhostButton")
+        self.undo_cut_button.clicked.connect(self._undo_cut)
+        sel_layout.addWidget(self.clip_label)
+        sel_actions = QHBoxLayout()
+        sel_actions.setSpacing(6)
+        sel_actions.addWidget(self.toggle_exclusion_button, 1)
+        sel_actions.addWidget(self.undo_cut_button)
+        sel_layout.addLayout(sel_actions)
+        clip_layout.addWidget(sel_card)
+
+        removed_card, removed_layout = _card()
+        removed_layout.addWidget(_label("글에서 빠질 구간", "CardKicker"))
         self.exclusion_list = QListWidget()
         self.exclusion_list.setAccessibleName("강의 글에서 빠질 구간 목록")
-        self.exclusion_list.setMinimumHeight(130)
+        self.exclusion_list.setMinimumHeight(120)
         self.exclusion_list.itemDoubleClicked.connect(self._seek_to_exclusion)
-        clip_layout.addWidget(self.exclusion_list, 1)
+        self.exclusion_empty = _label(
+            "아직 뺄 구간이 없어요. 파형에서 구간을 고르거나 자동으로 찾아보세요.",
+            "EmptyState",
+            True,
+        )
+        self.exclusion_empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        removed_layout.addWidget(self.exclusion_list, 1)
+        removed_layout.addWidget(self.exclusion_empty, 1)
+        clip_layout.addWidget(removed_card, 1)
+
+        self.inspector_scroll = QScrollArea()
+        self.inspector_scroll.setWidgetResizable(True)
+        self.inspector_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.inspector_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.inspector_scroll.setWidget(inspector)
+        self.inspector_scroll.setFixedWidth(336)
+
         work_area.addLayout(timeline_column, 1)
-        work_area.addWidget(clip_panel)
+        work_area.addWidget(self.inspector_scroll)
         root.addLayout(work_area, 1)
 
         bottom = QHBoxLayout()
+        bottom.setSpacing(8)
+        self.summary_label = _label("", "MutedLabel")
         cancel_button = QPushButton("나중에 이어하기")
-        cancel_button.setObjectName("SecondaryButton")
+        cancel_button.setObjectName("GhostButton")
         cancel_button.clicked.connect(self.reject)
         self.apply_button = QPushButton("이대로 오디오 정리하기")
         self.apply_button.setObjectName("PrimaryButton")
         self.apply_button.clicked.connect(self._apply)
-        legend = QLabel("주황선: 자른 곳 · 붉은 구간: 글에서 뺄 곳 · 분홍선: 현재 위치")
-        legend.setObjectName("HelperText")
-        bottom.addWidget(legend)
+        bottom.addWidget(self.summary_label)
         bottom.addStretch(1)
         bottom.addWidget(cancel_button)
         bottom.addWidget(self.apply_button)
@@ -555,12 +700,7 @@ class AudioEditorDialog(QDialog):
         if self._auto_thread and self._auto_thread.isRunning():
             self._cancel_auto_detection()
             return
-        self._auto_previous_state = (
-            self.cuts,
-            self.exclusions,
-            self.selected_segment,
-            self._auto_candidates,
-        )
+        self._auto_previous_state = None
         self._auto_cancel_event = Event()
         thread = QThread(self)
         worker = AutoDetectionWorker(self.request, self._auto_cancel_event)
@@ -614,6 +754,13 @@ class AudioEditorDialog(QDialog):
                 "자동으로 뺄 구간을 찾지 못했어요. 파형을 들으며 직접 잘라주세요."
             )
             return
+        # Snapshot now, so manual edits made while detection ran stay undoable.
+        self._auto_previous_state = (
+            self.cuts,
+            self.exclusions,
+            self.selected_segment,
+            self._auto_candidates,
+        )
         cut_points = [*self.cuts]
         for start, end in candidates:
             if start > self.request.range_start + 0.1:
@@ -621,6 +768,7 @@ class AudioEditorDialog(QDialog):
             if end < self.request.range_end - 0.1:
                 cut_points.append(end)
         self.cuts = tuple(sorted(set(cut_points)))
+        self._cut_history = [cut for cut in self._cut_history if cut in self.cuts]
         self.exclusions = normalize_exclusions(
             (*self.exclusions, *candidates),
             self.request.range_start,
@@ -694,14 +842,18 @@ class AudioEditorDialog(QDialog):
         if seconds <= self.request.range_start + 0.1 or seconds >= self.request.range_end - 0.1:
             return
         self.cuts = tuple(sorted((*self.cuts, seconds)))
+        self._cut_history.append(seconds)
         self.selected_segment = None
         self._seek_seconds(seconds)
         self._refresh_edit_state()
 
     def _undo_cut(self) -> None:
-        if not self.cuts:
+        while self._cut_history and self._cut_history[-1] not in self.cuts:
+            self._cut_history.pop()
+        if not self._cut_history:
             return
-        self.cuts = self.cuts[:-1]
+        last = self._cut_history.pop()
+        self.cuts = tuple(cut for cut in self.cuts if cut != last)
         self.selected_segment = None
         self._refresh_edit_state()
 
@@ -757,10 +909,18 @@ class AudioEditorDialog(QDialog):
         self._refresh_exclusion_list()
 
     def _refresh_edit_state(self) -> None:
+        if self.selected_segment is None:
+            self._clear_selection_ui()
         self.waveform.set_edit_state(
             self.cuts, self.exclusions, self.selected_segment
         )
         self._refresh_exclusion_list()
+
+    def _clear_selection_ui(self) -> None:
+        self.clip_label.setText(self.NO_SELECTION_TEXT)
+        self.toggle_exclusion_button.setText("선택 구간 빼기")
+        self.toggle_exclusion_button.setEnabled(False)
+        self.play_clip_button.setEnabled(False)
 
     def _refresh_exclusion_list(self) -> None:
         self.exclusion_list.clear()
@@ -780,6 +940,15 @@ class AudioEditorDialog(QDialog):
             item.setSizeHint(QSize(0, 52))
             item.setData(Qt.ItemDataRole.UserRole, (start, end))
             self.exclusion_list.addItem(item)
+        has_items = bool(self.exclusions)
+        self.exclusion_list.setVisible(has_items)
+        self.exclusion_empty.setVisible(not has_items)
+        removed = sum(end - start for start, end in self.exclusions)
+        self.summary_label.setText(
+            f"뺄 구간 {len(self.exclusions)}개 · 합쳐서 {format_duration(removed)}"
+            if has_items
+            else "뺄 구간 없음"
+        )
 
     def _auto_candidate_name(self, start: float, end: float) -> str:
         editable_duration = self.request.range_end - self.request.range_start
@@ -871,6 +1040,8 @@ class AudioEditorDialog(QDialog):
         if self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
             self.player.pause()
         else:
+            if self.player.position() >= round(self.request.range_end * 1000) - 50:
+                self.player.setPosition(round(self.request.range_start * 1000))
             self.player.play()
 
     def _play_selected_clip(self) -> None:
@@ -894,9 +1065,14 @@ class AudioEditorDialog(QDialog):
         self._seek_seconds(self.request.range_start)
 
     def _on_position_changed(self, position_ms: int) -> None:
-        if self._preview_stop_ms is not None and position_ms >= self._preview_stop_ms:
+        stop_ms = self._preview_stop_ms
+        range_end_ms = round(self.request.range_end * 1000)
+        if stop_ms is None or stop_ms > range_end_ms:
+            stop_ms = range_end_ms
+        if position_ms >= stop_ms and self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
             self.player.pause()
             self._preview_stop_ms = None
+            position_ms = stop_ms
         seconds = position_ms / 1000
         self.waveform.set_playhead(seconds)
         if not self.time_input.hasFocus():
@@ -971,10 +1147,28 @@ class AudioEditorDialog(QDialog):
                 self._set_tool(tool)
                 return
 
+    def _confirm_discard(self) -> bool:
+        if self._skip_discard_confirm or not (self.cuts or self.exclusions):
+            return True
+        answer = QMessageBox.question(
+            self,
+            "편집을 버릴까요?",
+            "지금까지 자르거나 뺀 구간이 모두 사라져요. 그래도 닫을까요?",
+            QMessageBox.StandardButton.Discard | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        if answer == QMessageBox.StandardButton.Discard:
+            self._skip_discard_confirm = True
+            return True
+        return False
+
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802
         if self._auto_thread and self._auto_thread.isRunning():
             self._close_after_detection = True
             self._cancel_auto_detection()
+            event.ignore()
+            return
+        if not self._confirm_discard():
             event.ignore()
             return
         self.release_media()
@@ -984,6 +1178,8 @@ class AudioEditorDialog(QDialog):
         if self._auto_thread and self._auto_thread.isRunning():
             self._close_after_detection = True
             self._cancel_auto_detection()
+            return
+        if not self._confirm_discard():
             return
         self.release_media()
         super().reject()

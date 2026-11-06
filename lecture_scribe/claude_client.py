@@ -6,6 +6,7 @@ import platform
 import shutil
 import subprocess
 from pathlib import Path
+from queue import Queue
 from threading import Event
 
 from .codex_client import (
@@ -102,6 +103,7 @@ def auth_status(timeout: int = 20) -> AuthStatus:
 def login(
     log: LogCallback | None = None,
     cancel_event: Event | None = None,
+    input_queue: Queue[str] | None = None,
 ) -> AuthStatus:
     executable = _require_claude()
     if log:
@@ -112,9 +114,11 @@ def login(
         log=log,
         cancel_event=cancel_event,
         emit_stderr=True,
+        emit_stdout=True,  # the CLI prints the sign-in URL on stdout
+        input_queue=input_queue,  # lets the UI forward the pasted auth code
     )
     if return_code != 0:
-        raise RuntimeError(_last_error(stderr or stdout, "Claude OAuth 로그인에 실패했습니다."))
+        raise RuntimeError(_last_error(f"{stderr}\n{stdout}", "Claude OAuth 로그인에 실패했습니다."))
     return auth_status()
 
 
@@ -196,7 +200,7 @@ def generate_text(
         emit_stderr=False,
     )
     if return_code != 0:
-        message = _last_error(stderr or stdout, failure_message)
+        message = _last_error(f"{stderr}\n{stdout}", failure_message)
         lowered = message.lower()
         if "login" in lowered or "unauthorized" in lowered or "authenticat" in lowered:
             message += "\n연결과 업데이트 화면에서 Claude 로그인을 다시 진행해주세요."

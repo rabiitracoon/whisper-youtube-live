@@ -1,11 +1,57 @@
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from uuid import uuid4
 
 from .paths import DEFAULT_PROMPT_PATH, OUTPUT_ROOT, PROMPT_PATH, SETTINGS_PATH
+
+
+_INVALID = object()
+
+
+def _back_up_corrupt(path: Path) -> None:
+    try:
+        path.replace(path.with_name(path.name + ".bad"))
+    except OSError:
+        pass
+
+
+def _coerce(value: object, default: object) -> object:
+    """Fit a stored value to the type of its default; _INVALID when it cannot."""
+    if isinstance(default, bool):
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)) and value in (0, 1):
+            return bool(value)
+        if isinstance(value, str) and value.strip().lower() in {"true", "false"}:
+            return value.strip().lower() == "true"
+        return _INVALID
+    if isinstance(default, int):
+        if isinstance(value, bool):
+            return _INVALID
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return _INVALID
+        return int(number) if math.isfinite(number) else _INVALID
+    if isinstance(default, float) or default is None:
+        if value is None:
+            return None if default is None else _INVALID
+        if isinstance(value, bool):
+            return _INVALID
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return _INVALID
+        return number if math.isfinite(number) else _INVALID
+    if isinstance(default, str):
+        return value if isinstance(value, str) else _INVALID
+    if isinstance(default, list):
+        return value if isinstance(value, list) else _INVALID
+    return value
 
 
 @dataclass(slots=True)
@@ -48,13 +94,27 @@ class AppSettings:
             return cls()
         try:
             raw = json.loads(path.read_text(encoding="utf-8"))
-            allowed = {field.name for field in fields(cls)}
-            values = {key: value for key, value in raw.items() if key in allowed}
+        except OSError:
+            return cls()
+        except ValueError:
+            raw = None
+        if not isinstance(raw, dict):
+            _back_up_corrupt(path)
+            return cls()
+        defaults = cls()
+        values = {}
+        for item in fields(cls):
+            if item.name not in raw:
+                continue
+            coerced = _coerce(raw[item.name], getattr(defaults, item.name))
+            if coerced is not _INVALID:
+                values[item.name] = coerced
+        try:
             settings = cls(**values)
             settings.ensure_prompt_slots()
-            return settings
         except (OSError, ValueError, TypeError):
             return cls()
+        return settings
 
     def save(self, path: Path = SETTINGS_PATH) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)

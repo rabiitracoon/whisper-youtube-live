@@ -1,105 +1,41 @@
-# Lecture Scribe Design System — Studio Shell
+# Lecture Scribe Design System: Calm Light
 
-## Product architecture
+A calm, light desktop app (Linear / Granola / MacWhisper inspired). One indigo accent, hairline borders, no shadows, Korean-first plain language. Source of truth: `lecture_scribe/ui/theme.py` (`COLORS`, `APP_STYLE`). Never hard-code hex values elsewhere; read `COLORS`.
 
-Lecture Scribe is a native Windows study-production tool, not a settings form. Its interface is built as a persistent desktop app shell:
+## Layout
 
-- 238 px dark navigation rail for product identity, destinations, and environment status.
-- Light adaptive workspace for page-specific work.
-- Bento project board for lecture intake and run options.
-- Dedicated dark media-editing workspace for waveform work.
-- Visible workflow: 영상 가져오기 → 쉬는 시간 정리 → 강의 글 확인 → 내 노트 완성.
+- Window: min 960x640, default 1240x820 clamped to the screen, geometry saved via QSettings.
+- Sidebar 232 px, `sidebar` background, 1 px right hairline. Brand = small accent dot + "Lecture Scribe". Four nav rows (icon + label); the selected row is a white pill with a border and weight 600 (not color alone). Ctrl+1..4 switch pages. Bottom: compact status rows (컴퓨터, AI 계정) using StatusPill, elided with tooltip.
+- Content: every page is a frameless transparent QScrollArea; padding 32; content column max 960 px, centered. Header = PageTitle (24/700) + one PageSubtitle line.
+- Spacing scale 4/8/12/16/24/32. Radii 6/8/12 only (controls 8, cards 12, pills 11).
 
-## Design dials
+## Tokens (`COLORS`)
 
-- Style: cinematic productivity shell + bento workspace.
-- Variance: 7/10 — visually distinct, asymmetric hierarchy.
-- Motion: 3/10 — restrained native state feedback only.
-- Density: 7/10 — productive without feeling cramped.
-- Platform: PySide6 on Windows, Korean-first.
-
-## Semantic colour system
-
-| Token | Value | Purpose |
-|---|---:|---|
-| Chrome | `#151722` | Persistent sidebar |
-| Chrome raised | `#1C1F2A` | Sidebar status card |
-| Canvas | `#F5F6F9` | Main workspace |
-| Surface | `#FFFFFF` | Primary bento cards |
-| Surface muted | `#F0F0F7` | Secondary/control cards |
-| Hero start | `#1C1E2A` | Project hero |
-| Hero end | `#352D68` | Project hero accent depth |
-| Primary | `#7161E5` | Primary action and active editor tool |
-| Primary soft | `#EBE8FF` | Suggested action |
-| Text | `#1A1D2B` | Main content |
-| Text muted | `#747A8A` | Supporting copy |
-| Dark text | `#D9DCE6` | Editor content |
-| Border | `#E0E2E9` | Light surface separation |
-| Dark border | `#303445` | Editor separation |
-| Success | `#7EDAA4` / `#17653A` | Ready states with labels |
-| Warning | `#F0C879` / `#845117` | Attention states with labels |
-| Danger | `#B42318` | Stop/error only |
+Surfaces `bg #F7F7F8`, `surface #FFF`, `surface_muted`, `sidebar`, `sidebar_active`, `sidebar_hover`. Borders `border`, `border_strong`. Text `text`, `text_secondary`, `text_tertiary`. Accent `accent #4F46E5` (+ hover/pressed/on/subtle/border). Status `success`, `warning`, `danger` each with `_subtle` (and `_border`). `focus`. Dark `editor_*` and `wave_*` tokens belong to the audio editor only (it styles itself).
 
 ## Typography
 
-- Malgun Gothic first for complete Korean rendering; Segoe UI fallback.
-- Cascadia Mono/Consolas for precise time values.
-- Page title 23 px; project title 23 px; section title 17 px; body 14 px; helper 11–12 px.
-- Use weight 700–750 for page/section identity, 600–650 for controls, regular for content.
+Base font set in `configure_fonts` (14 px pixel size; Pretendard if installed, else Malgun Gothic / Apple SD Gothic Neo). The stylesheet never sets font-size on the generic `QWidget` selector, only on named selectors: PageTitle 24/700, SectionTitle 16/600, FieldLabel 13/500, BodyText 13, HelperText 12 (tertiary), StatusPill 12/600. Log views use `MONO_STACK` at 12 px.
 
-## Navigation
+## Components (objectName)
 
-- Three persistent, labelled destinations with matching 20 px outline SVG icons:
-  - 새 강의 노트
-  - 노트 작성 방식
-  - 연결과 업데이트
-- Navigation remains visible while page content scrolls.
-- Active destination uses both a raised surface and stronger text; never colour alone.
-- Environment readiness lives at the bottom of the rail and is always available.
+- `QFrame#Card` (surface, 1 px border, radius 12); `tone="muted"` for nested panels.
+- Buttons, height 36, radius 8, padding 0 14: `PrimaryButton` (accent fill; one per page), `SecondaryButton` (also the bare QPushButton look), `GhostButton` (transparent; used for disclosure rows such as "고급 설정" with a chevron icon), `DangerButton` (danger text, tinted hover). `[compact="true"]` = min-height 0, padding 0 6.
+- `QLabel#StatusPill[tone=neutral|success|warning|danger|accent]` tinted bg, matching text and border.
+- Inputs: 36 px high (`SourceInput` 44), 1 px border; focus changes only border color (no layout shift). Combo chevron and spinbox arrows are SVG assets (absolute paths).
+- `Stepper`: four numbered circles (pending, active, done check, error "!") joined by connector lines; accent for active/done, danger for error.
+- Progress bar 6 px, no text; percent label beside it.
 
-## Surface hierarchy
+## Pages
 
-- Project hero: 20 px radius, dark tonal gradient, one clear story and four-step journey.
-- Main bento cards: 18 px radius, 1 px border, no generic drop shadows.
-- Action dock: dark 16 px surface separating the primary action from configuration.
-- Nested advanced panels: 12 px radius and a quieter tonal surface.
-- Inputs/buttons: 10–11 px radius; 40 px minimum height, 46 px primary height.
+1. 새 강의 노트: one source card (URL/file input 44 px + 붙여넣기/파일 선택, 강의명 (선택), save folder, primary 강의 노트 만들기). Below it a single status region that morphs idle (hidden) / running (stepper, bar, plain detail line, 잠시 멈추기, 자세히 보기 log) / review (transcript check) / done (title, message, elided path, 노트 열기 primary) / stopped. Then a "처리 방식" card with the main toggles and a "고급 설정" disclosure (recognition settings, step-by-step mode).
+2. 실시간 자막: separate module (`live_caption_page.py`), wrapped in the shared scroll shell.
+3. 노트 작성 방식: AI model card (provider, model, 생각 깊이: 빠르게/보통/깊게/더 깊게/최대) and 노트 양식 card (form combo, 새로 만들기/이름 바꾸기/삭제, editor min 240, 되돌리기, 저장).
+4. 연결과 업데이트: stacked cards (내 컴퓨터, AI 계정 연결, 업데이트, 자세한 기록), each with title + StatusPill + one-line description + actions. CLI paths only in tooltips. During login the 연결하기 button becomes 취소 and a code row with an instruction line appears.
 
-## Interaction
+## Behavior rules
 
-- One primary action per page.
-- Long work exposes progress, a plain-language stage, safe stop, and detailed log on request.
-- Advanced recognition settings and logs use progressive disclosure.
-- Completed pipeline stages remain resumable.
-- Focus is always visible; tab order follows the visual hierarchy.
-- SVG navigation icons use a consistent 1.5 px outline style.
-
-## Plain-language contract
-
-Default screens never expose internal terms. Mappings:
-
-| Internal | Visible |
-|---|---|
-| transcription | 강의 글 만들기 |
-| transcript | 강의 글 |
-| prompt | 노트 작성 방식 |
-| OAuth | ChatGPT 연결 |
-| VAD | 말이 없는 긴 구간 건너뛰기 |
-| checkpoint | 완료한 단계 / 저장된 단계 |
-| Razor | 자르기 |
-| playhead | 현재 위치 |
-| clip | 구간 |
-| yt-dlp | 영상 가져오기 도구 |
-
-Technical names are allowed only in troubleshooting details.
-
-## Accessibility and QA
-
-- Normal text contrast ≥4.5:1; dark secondary text ≥3:1.
-- Status always combines colour with readable text.
-- Interactive controls have pressed, focus, disabled, and selected states without layout shift.
-- Gestures and keyboard shortcuts always have visible button alternatives.
-- Long content uses one page scroll area; waveform horizontal scroll is intentional and labelled.
-- No emoji structural icons; vector assets only.
-- QA renders: main, advanced, review, prompt, tools, editor, and automatic detection.
-
+- Worker signals connect only to bound MainWindow slots (workers emit `completed(worker)`); never lambdas that touch widgets on the worker thread.
+- Buttons use Tab-only focus so a mouse click leaves no focus ring.
+- Visible copy is plain Korean; technical names (Whisper, CUDA, beam size) appear only in tooltips.
+- Errors: friendly dialog with raw detail written to the log; startup/status checks report inline instead of a dialog.

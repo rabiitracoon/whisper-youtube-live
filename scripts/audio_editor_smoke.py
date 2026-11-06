@@ -106,6 +106,7 @@ def main() -> int:
             return
         if verify_playback:
             print(f"Muted playback advanced to {dialog.player.position()} ms")
+        dialog._skip_discard_confirm = True  # edits were injected on purpose
         dialog.close()
         app.processEvents()
         if not dialog.player.source().isEmpty():

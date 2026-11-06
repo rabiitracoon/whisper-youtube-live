@@ -6,6 +6,7 @@ import platform
 import re
 import shutil
 import subprocess
+from queue import Empty, Queue
 import threading
 import time
 from dataclasses import dataclass
@@ -14,6 +15,7 @@ from threading import Event
 from typing import Callable
 
 from .paths import LOCAL_CODEX_ROOT, PROJECT_ROOT
+from .proc import kill_process_tree
 
 
 LogCallback = Callable[[str], None]
@@ -232,11 +234,13 @@ def _run_streaming(
     log: LogCallback | None,
     cancel_event: Event | None,
     emit_stderr: bool,
+    emit_stdout: bool = False,
+    input_queue: Queue[str] | None = None,
 ) -> tuple[int, str, str]:
     process = subprocess.Popen(
         command,
         cwd=PROJECT_ROOT,
-        stdin=subprocess.PIPE if input_text is not None else subprocess.DEVNULL,
+        stdin=subprocess.PIPE if (input_text is not None or input_queue is not None) else subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
@@ -260,7 +264,7 @@ def _run_streaming(
             stream.close()
 
     out_thread = threading.Thread(
-        target=read_stream, args=(process.stdout, stdout_lines, False), daemon=True
+        target=read_stream, args=(process.stdout, stdout_lines, emit_stdout), daemon=True
     )
     err_thread = threading.Thread(
         target=read_stream,
@@ -269,21 +273,44 @@ def _run_streaming(
     )
     out_thread.start()
     err_thread.start()
-    if input_text is not None and process.stdin:
-        try:
-            process.stdin.write(input_text)
-            process.stdin.close()
-        except (BrokenPipeError, OSError):
-            pass
-    while process.poll() is None:
-        if cancel_event and cancel_event.is_set():
-            process.terminate()
+
+    def write_stdin(text: str) -> None:
+        # Bypass the text layer so a newline is not translated to CRLF on Windows.
+        stdin = process.stdin
+        buffer = getattr(stdin, "buffer", None)
+        if buffer is not None:
+            buffer.write(text.encode("utf-8"))
+            buffer.flush()
+        else:
+            stdin.write(text)
+            stdin.flush()
+
+    try:
+        if input_text is not None and process.stdin:
             try:
-                process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                process.kill()
-            raise CodexCancelled("사용자가 AI 작업을 취소했습니다.")
-        time.sleep(0.2)
+                write_stdin(input_text)
+                process.stdin.close()
+            except (BrokenPipeError, OSError, ValueError):
+                pass
+        while process.poll() is None:
+            if input_queue is not None and process.stdin:
+                try:
+                    while True:
+                        write_stdin(input_queue.get_nowait() + "\n")
+                except Empty:
+                    pass
+                except (BrokenPipeError, OSError, ValueError):
+                    pass
+            if cancel_event and cancel_event.is_set():
+                kill_process_tree(process, wait_timeout=5)
+                raise CodexCancelled("사용자가 AI 작업을 취소했습니다.")
+            time.sleep(0.2)
+    finally:
+        if process.stdin:
+            try:
+                process.stdin.close()
+            except (BrokenPipeError, OSError, ValueError):
+                pass
     out_thread.join(timeout=3)
     err_thread.join(timeout=3)
     return process.returncode or 0, "".join(stdout_lines), "".join(stderr_lines)

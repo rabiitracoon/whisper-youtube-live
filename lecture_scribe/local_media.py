@@ -10,6 +10,10 @@ from .paths import safe_filename
 from .youtube import VideoInfo
 
 
+class _MediaError(Exception):
+    """Our own validation failure, as opposed to a decoder error from PyAV."""
+
+
 class LocalMediaCancelled(RuntimeError):
     pass
 
@@ -23,7 +27,10 @@ class LocalMedia:
 
 def resolve_local_media(value: str) -> LocalMedia:
     """Validate a local audio/video file and collect enough metadata for a job."""
-    path = Path(value).expanduser()
+    text = value.strip()
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in "\"'":
+        text = text[1:-1].strip()
+    path = Path(text).expanduser()
     if not path.is_file():
         raise ValueError("선택한 영상 또는 음성 파일을 찾을 수 없습니다.")
     path = path.resolve()
@@ -35,7 +42,7 @@ def resolve_local_media(value: str) -> LocalMedia:
             has_audio = any(stream.type == "audio" for stream in streams)
             has_video = any(stream.type == "video" for stream in streams)
             if not has_audio:
-                raise ValueError("음성 트랙이 있는 영상 또는 음성 파일을 선택해주세요.")
+                raise _MediaError("음성 트랙이 있는 영상 또는 음성 파일을 선택해주세요.")
             duration = (
                 float(container.duration / av.time_base)
                 if container.duration is not None
@@ -48,8 +55,8 @@ def resolve_local_media(value: str) -> LocalMedia:
                     if stream.duration is not None and stream.time_base is not None
                 ]
                 duration = max(stream_durations, default=0.0)
-    except ValueError:
-        raise
+    except _MediaError as exc:
+        raise ValueError(str(exc)) from None
     except Exception as exc:
         raise ValueError(
             "파일을 읽을 수 없습니다. 지원되는 영상 또는 음성 파일인지 확인해주세요."

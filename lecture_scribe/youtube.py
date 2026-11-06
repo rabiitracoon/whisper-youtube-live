@@ -160,8 +160,9 @@ def download_audio(
     if live_snapshot:
         options["live_from_start"] = True
     try:
-        with YoutubeDL(options) as ydl:
-            data = ydl.extract_info(url.strip(), download=True)
+        data = _extract_download(
+            YoutubeDL, options, url, lambda: _snapshot_exists(destination, f"{video_id}.*")
+        )
     except DownloadError as exc:
         if not _is_http_403(exc):
             raise
@@ -181,8 +182,10 @@ def download_audio(
             }
         )
         try:
-            with YoutubeDL(fallback_options) as ydl:
-                data = ydl.extract_info(url.strip(), download=True)
+            data = _extract_download(
+                YoutubeDL, fallback_options, url,
+                lambda: _snapshot_exists(destination, f"{video_id}.*"),
+            )
         except DownloadError as fallback_exc:
             raise RuntimeError(
                 "YouTube가 기본 경로와 모바일 웹 경로의 오디오 다운로드를 모두 거부했습니다. "
@@ -239,8 +242,9 @@ def download_video(
     if live_snapshot:
         options["live_from_start"] = True
     try:
-        with YoutubeDL(options) as ydl:
-            data = ydl.extract_info(url.strip(), download=True)
+        data = _extract_download(
+            YoutubeDL, options, url, lambda: _snapshot_exists(destination, "original_video.*")
+        )
     except DownloadError as exc:
         if not _is_http_403(exc):
             raise
@@ -258,8 +262,10 @@ def download_video(
             }
         )
         try:
-            with YoutubeDL(fallback_options) as ydl:
-                data = ydl.extract_info(url.strip(), download=True)
+            data = _extract_download(
+                YoutubeDL, fallback_options, url,
+                lambda: _snapshot_exists(destination, "original_video.*"),
+            )
         except DownloadError as fallback_exc:
             raise RuntimeError(
                 "YouTube가 기본 경로와 모바일 웹 경로의 영상 다운로드를 모두 거부했습니다. "
@@ -283,6 +289,24 @@ def download_video(
         ):
             return candidate.resolve()
     raise FileNotFoundError("다운로드는 완료되었지만 영상 파일을 찾지 못했습니다.")
+
+
+def _snapshot_exists(destination: Path, pattern: str) -> bool:
+    return any(
+        item.is_file() and item.suffix not in {".part", ".ytdl"}
+        for item in destination.glob(pattern)
+    )
+
+
+def _extract_download(ydl_class, options: dict, url: str, snapshot_exists: Callable[[], bool]):
+    """Run a download; a stray KeyboardInterrupt ends a live snapshot or cancels."""
+    try:
+        with ydl_class(options) as ydl:
+            return ydl.extract_info(url.strip(), download=True)
+    except KeyboardInterrupt:
+        if snapshot_exists():
+            return None
+        raise DownloadCancelled("사용자가 다운로드를 취소했습니다.") from None
 
 
 def _is_http_403(error: BaseException) -> bool:

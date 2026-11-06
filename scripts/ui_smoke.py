@@ -12,6 +12,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import QApplication, QScrollArea
 
+from lecture_scribe.config import AppSettings
 from lecture_scribe.ui.main_window import MainWindow
 from lecture_scribe.ui.theme import APP_STYLE, configure_fonts
 from lecture_scribe.quality import TranscriptReview
@@ -24,11 +25,13 @@ def main() -> int:
             "[--review|--advanced|--live|--prompt|--tools|--compact]"
         )
         return 2
+    AppSettings.save = lambda self, *args, **kwargs: None  # never touch the real settings.json
     app = QApplication([])
     app.setStyle("Fusion")
     configure_fonts(app)
     app.setStyleSheet(APP_STYLE)
     window = MainWindow()
+    window._save_geometry_on_close = False
     window.show()
     if len(sys.argv) == 3 and sys.argv[2] == "--review":
         sample_path = PROJECT_ROOT / "artifacts" / "sample_transcript.txt"
@@ -49,6 +52,7 @@ def main() -> int:
         )
         window.review_preview.setFocus()
     elif len(sys.argv) == 3 and sys.argv[2] == "--advanced":
+        window.advanced_toggle.setChecked(True)
         window.advanced_mode_check.setChecked(True)
     elif len(sys.argv) == 3 and sys.argv[2] == "--live":
         window._switch_page(1)
@@ -57,12 +61,12 @@ def main() -> int:
     elif len(sys.argv) == 3 and sys.argv[2] == "--tools":
         window._switch_page(3)
     elif len(sys.argv) == 3 and sys.argv[2] == "--compact":
-        window.resize(1080, 720)
+        window.resize(1080, 720)  # compact: near the 960x640 minimum
 
     def capture() -> None:
         if len(sys.argv) == 3 and sys.argv[2] == "--review":
             for scroll_area in window.findChildren(QScrollArea):
-                scroll_area.ensureWidgetVisible(window.review_card, 20, 20)
+                scroll_area.ensureWidgetVisible(window.status_card, 20, 20)
             app.processEvents()
         elif len(sys.argv) == 3 and sys.argv[2] == "--advanced":
             for scroll_area in window.findChildren(QScrollArea):

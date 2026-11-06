@@ -392,12 +392,22 @@ def render_edited_audio(
 
 
 def map_edited_time_to_original(
-    seconds: float, included_ranges: tuple[tuple[float, float], ...]
+    seconds: float,
+    included_ranges: tuple[tuple[float, float], ...],
+    is_end: bool = True,
 ) -> float:
+    """Map a time in the edited audio back to the original timeline.
+
+    A time exactly on a cut boundary belongs to the end of the earlier range when
+    ``is_end`` is true (segment ends) and to the start of the next range otherwise.
+    """
     remaining = max(0.0, seconds)
-    for start, end in included_ranges:
+    last_index = len(included_ranges) - 1
+    for index, (start, end) in enumerate(included_ranges):
         duration = end - start
-        if remaining <= duration:
+        if remaining < duration or (
+            remaining == duration and (is_end or index == last_index)
+        ):
             return start + remaining
         remaining -= duration
     return included_ranges[-1][1]

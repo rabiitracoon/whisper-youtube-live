@@ -4,9 +4,10 @@ import os
 import platform
 import site
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
-from threading import Event
+from threading import Event, Lock
 from typing import Callable, Iterable
 
 from .audio_edit import map_edited_time_to_original
@@ -35,6 +36,7 @@ LOCAL_MLX_MODELS = {
 }
 _DLL_HANDLES: list[object] = []
 _CUDA_MODEL_CACHE: dict[tuple[str, str], object] = {}
+_CUDA_MODEL_LOCK = Lock()
 
 
 class TranscriptionCancelled(RuntimeError):
@@ -160,17 +162,49 @@ def verify_cuda() -> str:
     return str(torch.cuda.get_device_name(0))
 
 
-def _get_cuda_model(model_name: str, compute_type: str, log: LogCallback | None):
+def _get_cuda_model(
+    model_name: str,
+    compute_type: str,
+    log: LogCallback | None,
+    cancel_event: Event | None = None,
+):
     key = (model_name, compute_type)
     if key in _CUDA_MODEL_CACHE:
         if log:
             log(f"메모리에 로드된 Whisper {model_name} 모델을 재사용합니다.")
         return _CUDA_MODEL_CACHE[key]
+    with _CUDA_MODEL_LOCK:
+        if key in _CUDA_MODEL_CACHE:
+            return _CUDA_MODEL_CACHE[key]
+        return _load_cuda_model(key, model_name, compute_type, log, cancel_event)
+
+
+def _load_cuda_model(
+    key: tuple[str, str],
+    model_name: str,
+    compute_type: str,
+    log: LogCallback | None,
+    cancel_event: Event | None,
+):
     prepare_cuda_runtime()
     from faster_whisper import WhisperModel
 
+    # Fetch the files first so the download shows progress and avoids the hf_xet
+    # backend, which looks frozen at 0 bytes. Imported here: model_download
+    # imports this module.
+    from .model_download import prefetch_model
+
+    last_report = [0.0]
+
+    def report_download(progress) -> None:
+        now = time.monotonic()
+        if log and now - last_report[0] >= 3.0:
+            last_report[0] = now
+            log(progress.message)
+
+    prefetch_model(model_name, report_download, cancel_event, log)
     if log:
-        log(f"Whisper {model_name} 모델을 불러옵니다. 첫 실행은 모델 다운로드가 필요합니다.")
+        log(f"Whisper {model_name} 모델을 GPU에 불러옵니다.")
     model = WhisperModel(model_name, device="cuda", compute_type=compute_type, num_workers=1)
     _CUDA_MODEL_CACHE[key] = model
     return model
@@ -259,7 +293,7 @@ def transcribe_audio(
         raw_segments, full_duration, detected_language, probability = _transcribe_cuda(
             audio_path, video, model_name, language, compute_type, beam_size,
             clip_timestamps, initial_prompt, range_text, timestamp_map, vad_filter,
-            has_explicit_clip, log,
+            has_explicit_clip, log, cancel_event,
         )
     if log and prompt_terms:
         log(f"전문용어 {len(prompt_terms)}개를 Whisper 문맥에 자동 적용합니다.")
@@ -294,7 +328,7 @@ def transcribe_audio(
             segment_start = raw_start
             segment_end = raw_end
             if timestamp_map:
-                segment_start = map_edited_time_to_original(raw_start, timestamp_map)
+                segment_start = map_edited_time_to_original(raw_start, timestamp_map, is_end=False)
                 segment_end = map_edited_time_to_original(raw_end, timestamp_map)
             segments.append(
                 TranscriptSegment(
@@ -419,8 +453,9 @@ def _transcribe_cuda(
     initial_prompt: str | None, range_text: str,
     timestamp_map: tuple[tuple[float, float], ...], vad_filter: bool,
     has_explicit_clip: bool, log: LogCallback | None,
+    cancel_event: Event | None = None,
 ) -> tuple[Iterable[object], float, str, float]:
-    model = _get_cuda_model(model_name, compute_type, log)
+    model = _get_cuda_model(model_name, compute_type, log, cancel_event)
     effective_vad = vad_filter and not has_explicit_clip
     if log:
         log(f"정확도 우선 설정(beam={beam_size}, FP16)으로 CUDA 전사를 시작합니다. 구간: {range_text}")
@@ -452,6 +487,7 @@ def transcribe_samples(
     compute_type: str = "float16",
     beam_size: int = 1,
     log: LogCallback | None = None,
+    cancel_event: Event | None = None,
 ) -> list[TranscriptSegment]:
     """Transcribe an in-memory 16 kHz mono float32 buffer (used by live captions)."""
     backend = runtime_backend()
@@ -476,7 +512,7 @@ def transcribe_samples(
         )
         raw_segments: Iterable[object] = result.get("segments", [])
     else:
-        model = _get_cuda_model(model_name, compute_type, log)
+        model = _get_cuda_model(model_name, compute_type, log, cancel_event)
         raw_segments, _info = model.transcribe(
             samples, task="transcribe",
             language=None if language == "auto" else language,
@@ -542,6 +578,9 @@ def _to_markdown(video: VideoInfo, segments: list[TranscriptSegment]) -> str:
     ]
     for item in segments:
         seconds = int(item.start)
+        if video.video_id.startswith("local_"):
+            lines.append(f"- [{format_duration(item.start)}] {item.text}")
+            continue
         link = f"https://www.youtube.com/watch?v={video.video_id}&t={seconds}s"
         lines.append(f"- [{format_duration(item.start)}]({link}) {item.text}")
     return "\n".join(lines) + "\n"

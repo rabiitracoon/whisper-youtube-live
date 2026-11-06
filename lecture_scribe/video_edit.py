@@ -7,8 +7,11 @@ from functools import lru_cache
 from pathlib import Path
 from threading import Event
 
+from .proc import kill_process_tree
+from .youtube import DownloadCancelled
 
-class VideoRenderCancelled(RuntimeError):
+
+class VideoRenderCancelled(DownloadCancelled):
     pass
 
 
@@ -66,7 +69,7 @@ def render_edited_video(
         "-y",
         "-i",
         str(source_path),
-        "-filter_complex_script",
+        "-/filter_complex",
         str(filter_path),
         "-map",
         "[outv]",
@@ -96,12 +99,31 @@ def render_edited_video(
         if log:
             log(f"영상 인코더: {encoder_label}")
         try:
-            _run_ffmpeg(
-                [*command_prefix, *encoder_args, *command_suffix],
-                cancel_event,
-                progress,
-                total_duration,
-            )
+            try:
+                _run_ffmpeg(
+                    [*command_prefix, *encoder_args, *command_suffix],
+                    cancel_event,
+                    progress,
+                    total_duration,
+                )
+            except RuntimeError as exc:
+                if (
+                    isinstance(exc, VideoRenderCancelled)
+                    or "Unrecognized option" not in str(exc)
+                    or "filter_complex" not in str(exc)
+                ):
+                    raise
+                # Older ffmpeg builds only know the script-file spelling.
+                legacy_prefix = [
+                    "-filter_complex_script" if item == "-/filter_complex" else item
+                    for item in command_prefix
+                ]
+                _run_ffmpeg(
+                    [*legacy_prefix, *encoder_args, *command_suffix],
+                    cancel_event,
+                    progress,
+                    total_duration,
+                )
         except VideoRenderCancelled:
             raise
         except RuntimeError as exc:
@@ -239,8 +261,7 @@ def _run_ffmpeg(
         assert process.stdout is not None
         for raw_line in iter(process.stdout.readline, ""):
             if cancel_event and cancel_event.is_set():
-                process.terminate()
-                process.wait(timeout=10)
+                kill_process_tree(process)
                 raise VideoRenderCancelled("사용자가 영상 편집본 저장을 취소했습니다.")
             line = raw_line.strip()
             if line:
@@ -262,12 +283,7 @@ def _run_ffmpeg(
         return
     except Exception:
         if process and process.poll() is None:
-            process.terminate()
-            try:
-                process.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait()
+            kill_process_tree(process)
         raise
     finally:
         if process and process.stdout:

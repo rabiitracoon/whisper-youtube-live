@@ -310,8 +310,13 @@ class CaptionWriter:
     """Append captions to txt/srt files as they arrive so nothing is lost on a crash."""
 
     def __init__(self, output_root: Path, title: str, started_at: datetime):
-        folder_name = safe_filename(f"{started_at:%Y-%m-%d %H%M} 실시간 자막 {title}")
-        self.folder = output_root / folder_name
+        folder_name = safe_filename(f"{started_at:%Y-%m-%d %H%M%S} 실시간 자막 {title}")
+        folder = output_root / folder_name
+        suffix = 2
+        while folder.exists():
+            folder = output_root / f"{folder_name}_{suffix}"
+            suffix += 1
+        self.folder = folder
         self.folder.mkdir(parents=True, exist_ok=True)
         self.text_path = self.folder / "live_captions.txt"
         self.srt_path = self.folder / "live_captions.srt"
@@ -355,6 +360,7 @@ class LiveCaptioner:
         self.started_at = datetime.now()
         self.recent_text = ""
         self._last_partial_size = 0
+        self.cancel_event: Event | None = None
 
     # Separate from ``run`` so the segmentation logic can be driven by tests.
     def feed(self, samples: np.ndarray, backlog: float = 0.0) -> None:
@@ -364,6 +370,8 @@ class LiveCaptioner:
         max_samples = int(options.max_chunk * SAMPLE_RATE)
         if len(self.pending) >= max_samples:
             while len(self.pending) >= max_samples:
+                if self.cancel_event is not None and self.cancel_event.is_set():
+                    break
                 cut = quietest_cut(
                     self.pending[:max_samples], search_seconds=min(5.0, options.max_chunk / 2)
                 )
@@ -389,8 +397,9 @@ class LiveCaptioner:
             self.on_partial(" ".join(segment.text for segment in segments))
 
     def flush(self) -> None:
-        if self.pending.size:
-            self._finalize(len(self.pending))
+        max_samples = max(1, int(self.options.max_chunk * SAMPLE_RATE))
+        while self.pending.size:
+            self._finalize(min(len(self.pending), max_samples))
 
     def _transcribe(self, samples: np.ndarray) -> list[TranscriptSegment]:
         options = self.options
@@ -468,6 +477,7 @@ def run_live_captions(
         on_caption(caption)
 
     captioner = LiveCaptioner(options, handle_caption, on_partial, log)
+    captioner.cancel_event = cancel_event
     writer_holder.append(CaptionWriter(output_root, source.title, captioner.started_at))
     log(f"자막 저장 위치: {writer_holder[0].folder}")
     ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
@@ -502,15 +512,33 @@ def run_live_captions(
     stream = PcmStream(build_ffmpeg_command(ffmpeg, source))
     on_status("자막 생성 중")
     last_lag_warning = 0.0
+    failures = 0
+
+    def guarded(action: Callable[..., None], *args, **kwargs) -> None:
+        """Run one captioning step; a bad chunk is logged, repeated failures abort."""
+        nonlocal failures
+        try:
+            action(*args, **kwargs)
+        except Exception as exc:
+            failures += 1
+            log(f"자막 생성 중 오류({failures}/5): {exc}")
+            if failures >= 5:
+                raise RuntimeError(
+                    f"자막 생성이 연속으로 {failures}번 실패해 중단합니다. "
+                    f"{exc}"
+                ) from exc
+        else:
+            failures = 0
+
     try:
         while True:
             if cancel_event.is_set():
-                captioner.flush()
+                guarded(captioner.flush)
                 break
             samples = stream.take()
             if samples.size == 0:
                 if stream.ended:
-                    captioner.flush()
+                    guarded(captioner.flush)
                     if not source.is_live or reconnects >= 5:
                         details = stream.error_text()
                         if details and captioner.pending_start < 1:
@@ -548,7 +576,7 @@ def run_live_captions(
                     f"전사가 방송보다 {backlog:.0f}초 늦습니다. "
                     "더 가벼운 음성 인식 모델(large-v3-turbo, medium)을 선택해보세요."
                 )
-            captioner.feed(samples, backlog=backlog)
+            guarded(captioner.feed, samples, backlog=backlog)
     finally:
         stream.close()
     return writer_holder[0].folder

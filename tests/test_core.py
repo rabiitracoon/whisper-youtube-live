@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import subprocess
 import tempfile
 import unittest
@@ -1134,6 +1135,87 @@ class QwenEngineTests(unittest.TestCase):
             segments = transcribe_samples(np.zeros(32_000, dtype="float32"), "qwen3-asr-1.7b", "ko")
         self.assertFalse(fake.call_args.kwargs["timestamps"])
         self.assertEqual(segments[0].text, "실시간 문장")
+
+
+class RegressionFixTests(unittest.TestCase):
+    def test_parse_timecode_rejects_non_finite_and_underscores(self) -> None:
+        for bad in ("nan", "inf", "1_0", "1e3", "-5", "00:nan"):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                parse_timecode(bad)
+        self.assertEqual(parse_timecode("1.5"), 1.5)
+
+    def test_segment_start_on_cut_boundary_maps_to_next_range(self) -> None:
+        ranges = ((0.0, 10.0), (30.0, 40.0))
+        self.assertEqual(map_edited_time_to_original(10, ranges, is_end=False), 30)
+        self.assertEqual(map_edited_time_to_original(10, ranges), 10)
+        self.assertEqual(map_edited_time_to_original(20, ranges, is_end=False), 40)
+
+    def test_faster_whisper_repo_ignores_local_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            self.assertIsNone(model_download._faster_whisper_repo(directory))
+        self.assertIsNone(model_download._faster_whisper_repo(r"C:\models\whisper"))
+        self.assertIsNone(model_download._faster_whisper_repo("./models/whisper"))
+        self.assertIsNone(model_download._faster_whisper_repo("/opt/models/whisper"))
+        self.assertEqual(model_download._faster_whisper_repo("org/repo"), "org/repo")
+
+    def test_settings_survive_corrupt_and_mistyped_files(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "settings.json"
+            path.write_text("[1, 2]", encoding="utf-8")
+            self.assertEqual(AppSettings.load(path).beam_size, 5)
+            self.assertTrue((Path(directory) / "settings.json.bad").exists())
+            self.assertFalse(path.exists())
+
+            path.write_text(
+                '{"beam_size": "7", "vad_filter": "nope", "clip_end_seconds": "12.5",'
+                ' "language": 3, "unknown": 1}',
+                encoding="utf-8",
+            )
+            loaded = AppSettings.load(path)
+            self.assertEqual(loaded.beam_size, 7)
+            self.assertTrue(loaded.vad_filter)
+            self.assertEqual(loaded.clip_end_seconds, 12.5)
+            self.assertEqual(loaded.language, "auto")
+
+    def test_rerunning_notes_does_not_need_original_audio(self) -> None:
+        from lecture_scribe import pipeline
+
+        with tempfile.TemporaryDirectory() as directory:
+            job = Path(directory)
+            (job / "edited_lecture.flac").write_bytes(b"x")
+            for name in ("t.txt", "t.md", "t.srt"):
+                (job / name).write_text("x", encoding="utf-8")
+            state = {
+                "version": 2,
+                "video": {
+                    "video_id": "abc", "title": "T", "channel": "C",
+                    "duration": 10.0, "webpage_url": "https://youtu.be/abc",
+                },
+                "completed_stages": ["download", "edit", "transcribe"],
+                "artifacts": {
+                    "edited_audio": "edited_lecture.flac",
+                    "transcript_text": "t.txt",
+                    "transcript_markdown": "t.md",
+                    "transcript_srt": "t.srt",
+                },
+                "edit": {"included_ranges": [[0, 10]]},
+                "transcript": {"clip_ranges": [[0, 10]]},
+            }
+            (job / "checkpoint.json").write_text(json.dumps(state), encoding="utf-8")
+            video = VideoInfo("abc", "T", "C", 10.0, "https://youtu.be/abc")
+            settings = AppSettings(output_dir=directory, keep_audio=False)
+            with (
+                patch.object(pipeline, "fetch_video_info", return_value=video),
+                patch.object(pipeline, "auth_status", return_value=SimpleNamespace(
+                    available=True, logged_in=True, detail="")),
+                patch.object(pipeline, "_resolve_job", return_value=(job, state)),
+                patch.object(pipeline, "generate_notes",
+                             side_effect=lambda **kw: kw["output_path"].write_text("n", encoding="utf-8")),
+            ):
+                result = pipeline.run_pipeline(
+                    "https://youtu.be/abc", settings, target_stage="notes"
+                )
+            self.assertEqual(result.completed_stage, "notes")
 
 
 if __name__ == "__main__":

@@ -210,20 +210,25 @@ def run_pipeline(
             "download",
             artifacts=artifacts,
         )
-    elif not audio_path or not audio_path.exists():
-        raise RuntimeError(
-            "저장된 원본 오디오가 없습니다. 고급 모드의 ‘1. 원본 다운로드’를 먼저 실행해주세요."
-        )
     if target_stage == "download":
         emit(100, "원본 다운로드 완료", "다음에 편집 단계부터 이어서 할 수 있습니다.")
         return _make_result(job_dir, video, state, "download")
 
     edited_path = _state_artifact(job_dir, state, "edited_audio")
     edited_video_path = _state_artifact(job_dir, state, "edited_video")
+    saved_edit = state.get("edit") or {}
+    clip_changed = (
+        "clip_start" in saved_edit
+        and (
+            not _same_seconds(saved_edit.get("clip_start"), clip_start)
+            or not _same_seconds(saved_edit.get("clip_end"), clip_end)
+        )
+    )
     should_edit = target_stage == "edit" or (
         target_stage == "all"
         and (
             "edit" not in state["completed_stages"]
+            or clip_changed
             or not edited_path
             or not edited_path.exists()
             or (
@@ -232,7 +237,13 @@ def run_pipeline(
             )
         )
     )
+    if should_edit and (not audio_path or not audio_path.exists()):
+        raise RuntimeError(
+            "저장된 원본 오디오가 없습니다. 고급 모드의 ‘1. 원본 다운로드’를 먼저 실행해주세요."
+        )
     if should_edit:
+        if clip_changed and log:
+            log("전사 구간이 바뀌어 편집 단계를 다시 실행합니다.")
         emit(20, "파형 준비", "저장된 원본에서 파형을 생성합니다.")
         audio_duration, peaks = extract_waveform(
             audio_path,
@@ -302,6 +313,8 @@ def run_pipeline(
             )
             edit_artifacts["edited_video"] = edited_video_path.name
         state["edit"] = {
+            "clip_start": clip_start,
+            "clip_end": clip_end,
             "excluded_ranges": [list(item) for item in exclusions],
             "included_ranges": [list(item) for item in included_ranges],
             "edited_duration": sum(end - start for start, end in included_ranges),
@@ -357,7 +370,7 @@ def run_pipeline(
             language=settings.language,
             compute_type=settings.compute_type,
             beam_size=settings.beam_size,
-            vad_filter=True,
+            vad_filter=settings.vad_filter,
             original_ranges=included_ranges,
             prompt_terms=prompt_terms,
             progress=lambda ratio, detail: emit(
@@ -421,7 +434,7 @@ def run_pipeline(
             "notes",
             artifacts={"notes": notes_path.name},
         )
-        if not settings.keep_audio and audio_path.exists():
+        if not settings.keep_audio and audio_path and audio_path.exists():
             if _remove_original_audio(audio_path, log):
                 state["artifacts"].pop("original_audio", None)
                 _save_checkpoint(job_dir, state)
@@ -598,6 +611,23 @@ def _mark_stage(
     _save_checkpoint(job_dir, state)
 
 
+_STAGE_ARTIFACTS = {
+    "download": ("original_audio", "original_video"),
+    "edit": ("edited_audio", "edited_video"),
+    "transcribe": ("transcript_text", "transcript_markdown", "transcript_srt"),
+    "notes": ("notes",),
+}
+
+
+def _same_seconds(left: object, right: object) -> bool:
+    if left is None or right is None:
+        return left is None and right is None
+    try:
+        return abs(float(left) - float(right)) < 1e-6
+    except (TypeError, ValueError):
+        return False
+
+
 def _invalidate_after(state: dict, stage: str) -> None:
     stage_index = PIPELINE_STAGES.index(stage)
     state["completed_stages"] = [
@@ -605,6 +635,10 @@ def _invalidate_after(state: dict, stage: str) -> None:
         for item in state.get("completed_stages", [])
         if PIPELINE_STAGES.index(item) <= stage_index
     ]
+    artifacts = state.get("artifacts", {})
+    for later in PIPELINE_STAGES[stage_index + 1 :]:
+        for key in _STAGE_ARTIFACTS[later]:
+            artifacts.pop(key, None)
 
 
 def _save_checkpoint(job_dir: Path, state: dict) -> None:
@@ -727,7 +761,7 @@ def _write_metadata(
             "language": settings.language,
             "compute_type": settings.compute_type,
             "beam_size": settings.beam_size,
-            "vad_filter": True,
+            "vad_filter": settings.vad_filter,
             "clip_start_seconds": clip_start,
             "clip_end_seconds": clip_end,
             "excluded_break_ranges": [list(item) for item in exclusions],

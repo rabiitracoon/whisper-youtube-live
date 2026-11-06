@@ -41,7 +41,9 @@ def latest_version(channel: str = "nightly", timeout: int = 20) -> str:
     if channel == "stable":
         return str(data["info"]["version"])
     candidates: list[Version] = []
-    for raw in data.get("releases", {}):
+    for raw, files in data.get("releases", {}).items():
+        if files and all(item.get("yanked") for item in files):
+            continue
         try:
             candidates.append(Version(raw))
         except InvalidVersion:
@@ -65,7 +67,7 @@ def check_and_update(
         if log:
             log(f"이미 최신 버전입니다: {previous}")
         return UpdateResult(previous, latest, previous, False, channel)
-    command = [sys.executable, "-m", "pip", "install", "--upgrade"]
+    command = [sys.executable, "-m", "pip", "install", "--upgrade", "--disable-pip-version-check"]
     if channel == "nightly":
         command.append("--pre")
     command.append("yt-dlp[default]")
@@ -81,10 +83,13 @@ def check_and_update(
         creationflags=int(getattr(subprocess, "CREATE_NO_WINDOW", 0)),
     )
     assert process.stdout is not None
+    cancel_logged = False
     for line in iter(process.stdout.readline, ""):
-        if cancel_event and cancel_event.is_set():
-            process.terminate()
-            raise RuntimeError("yt-dlp 업데이트가 취소되었습니다.")
+        if cancel_event and cancel_event.is_set() and not cancel_logged:
+            # Killing pip mid-install can leave yt-dlp half-installed, so let it finish.
+            cancel_logged = True
+            if log:
+                log("업데이트 설치가 끝날 때까지 기다립니다. 중간에 끊으면 설치가 손상될 수 있습니다.")
         cleaned = line.strip()
         if cleaned and log:
             log(cleaned)

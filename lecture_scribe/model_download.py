@@ -22,6 +22,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from threading import Event
 
+from .youtube import DownloadCancelled as _BaseDownloadCancelled
 from .qwen_asr_engine import QWEN_MODELS, is_qwen_model
 from .transcription import resolve_mlx_model, runtime_backend
 
@@ -40,7 +41,7 @@ FASTER_WHISPER_PATTERNS = (
 )
 
 
-class DownloadCancelled(RuntimeError):
+class DownloadCancelled(_BaseDownloadCancelled):
     pass
 
 
@@ -127,6 +128,13 @@ def model_repositories(model_name: str) -> list[ModelRepo]:
 
 
 def _faster_whisper_repo(model_name: str) -> str | None:
+    if (
+        os.path.isdir(model_name)
+        or ":" in model_name
+        or "\\" in model_name
+        or model_name.startswith((".", "/"))
+    ):
+        return None  # a local model folder, not a hub repo
     if "/" in model_name:
         return model_name
     try:
@@ -181,14 +189,24 @@ def is_cached(repo: ModelRepo) -> bool:
         return False
     # local_files_only only proves the snapshot folder exists. An interrupted
     # download leaves it holding the small files while model.bin is missing.
-    expected = remote_files(repo)
-    if expected is not None:
-        return all((folder / name).is_file() for name in expected)
-    # Offline: trust the snapshot unless a download was left unfinished.
     blobs = _repo_dir(repo.repo_id) / "blobs"
     if blobs.is_dir() and any(blobs.glob("*.incomplete")):
         return False
-    return any(path.is_file() for path in folder.rglob("*"))
+    local_files = [path for path in folder.rglob("*") if path.is_file()]
+    if not local_files:
+        return False
+    if repo.allow_patterns:
+        names = [path.relative_to(folder).as_posix() for path in local_files]
+        return all(
+            any(fnmatch.fnmatch(name, pattern) for name in names)
+            for pattern in repo.allow_patterns
+        )
+    # No pattern list to verify against: ask the hub, but trust the local
+    # snapshot when it cannot be reached.
+    expected = remote_files(repo)
+    if expected is None:
+        return True
+    return all((folder / name).is_file() for name in expected)
 
 
 def remote_files(repo: ModelRepo) -> dict[str, int] | None:

@@ -1,5 +1,10 @@
 from __future__ import annotations
 
+import math
+import re
+
+_NUMBER_RE = re.compile(r"\d+(?:\.\d*)?|\.\d+")
+
 
 def parse_timecode(value: str) -> float | None:
     """Parse seconds, MM:SS, or HH:MM:SS. An empty value means no boundary."""
@@ -9,12 +14,13 @@ def parse_timecode(value: str) -> float | None:
     parts = text.split(":")
     if len(parts) > 3 or any(not part.strip() for part in parts):
         raise ValueError("시간은 초, MM:SS 또는 HH:MM:SS 형식으로 입력해주세요.")
-    try:
-        numbers = [float(part) for part in parts]
-    except ValueError as exc:
-        raise ValueError("시간에는 숫자와 콜론(:)만 사용할 수 있습니다.") from exc
-    if any(number < 0 for number in numbers):
+    if any(part.strip().startswith("-") for part in parts):
         raise ValueError("시간은 0보다 작을 수 없습니다.")
+    if not all(_NUMBER_RE.fullmatch(part.strip()) for part in parts):
+        raise ValueError("시간에는 숫자와 콜론(:)만 사용할 수 있습니다.")
+    numbers = [float(part) for part in parts]
+    if not all(math.isfinite(number) for number in numbers):
+        raise ValueError("시간에는 숫자와 콜론(:)만 사용할 수 있습니다.")
     if len(numbers) >= 2 and numbers[-1] >= 60:
         raise ValueError("초는 60보다 작아야 합니다.")
     if len(numbers) == 3 and numbers[-2] >= 60:

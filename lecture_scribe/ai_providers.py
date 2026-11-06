@@ -88,7 +88,10 @@ def login(
     provider: str,
     log: LogCallback | None = None,
     cancel_event: Event | None = None,
+    input_queue=None,
 ) -> AuthStatus:
+    if provider == CLAUDE:
+        return _client(provider).login(log, cancel_event, input_queue)
     return _client(provider).login(log, cancel_event)
 
 

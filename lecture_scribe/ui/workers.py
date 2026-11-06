@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from queue import Queue
 from threading import Event
 
 from PySide6.QtCore import QObject, Signal, Slot
@@ -25,6 +26,7 @@ class PipelineWorker(QObject):
     review_ready = Signal(object)
     cancelled = Signal(str)
     error = Signal(str)
+    completed = Signal(object)
     finished = Signal()
 
     def __init__(self, url: str, settings: AppSettings, target_stage: str = "all"):
@@ -64,6 +66,7 @@ class PipelineWorker(QObject):
         except Exception as exc:  # UI boundary: present an actionable error to the user.
             self.error.emit(str(exc))
         finally:
+            self.completed.emit(self)
             self.finished.emit()
 
     def cancel(self) -> None:
@@ -110,6 +113,7 @@ class AuthWorker(QObject):
     log = Signal(str)
     result = Signal(object)
     error = Signal(str)
+    completed = Signal(object)
     finished = Signal()
 
     def __init__(self, action: str, provider: str):
@@ -117,12 +121,16 @@ class AuthWorker(QObject):
         self.action = action
         self.provider = provider
         self.cancel_event = Event()
+        self.input_queue: Queue[str] = Queue()
+
+    def send_input(self, text: str) -> None:
+        self.input_queue.put(text)
 
     @Slot()
     def run(self) -> None:
         try:
             if self.action == "login":
-                value = login(self.provider, self.log.emit, self.cancel_event)
+                value = login(self.provider, self.log.emit, self.cancel_event, self.input_queue)
             elif self.action == "logout":
                 value = logout(self.provider)
             else:
@@ -131,6 +139,7 @@ class AuthWorker(QObject):
         except Exception as exc:
             self.error.emit(str(exc))
         finally:
+            self.completed.emit(self)
             self.finished.emit()
 
     def cancel(self) -> None:
@@ -139,6 +148,7 @@ class AuthWorker(QObject):
 
 class ModelListWorker(QObject):
     result = Signal(object)
+    completed = Signal(object)
     finished = Signal()
 
     def __init__(self, provider: str):
@@ -151,6 +161,7 @@ class ModelListWorker(QObject):
             # fetch_catalog never raises for CLI problems; it falls back instead.
             self.result.emit(fetch_catalog(self.provider))
         finally:
+            self.completed.emit(self)
             self.finished.emit()
 
 
@@ -158,6 +169,7 @@ class UpdateWorker(QObject):
     log = Signal(str)
     result = Signal(object)
     error = Signal(str)
+    completed = Signal(object)
     finished = Signal()
 
     def __init__(self, channel: str):
@@ -175,6 +187,7 @@ class UpdateWorker(QObject):
         except Exception as exc:
             self.error.emit(str(exc))
         finally:
+            self.completed.emit(self)
             self.finished.emit()
 
 
@@ -186,6 +199,7 @@ class LiveCaptionWorker(QObject):
     log = Signal(str)
     result = Signal(object)
     error = Signal(str)
+    completed = Signal(object)
     finished = Signal()
 
     def __init__(
@@ -221,6 +235,7 @@ class LiveCaptionWorker(QObject):
         except Exception as exc:  # UI boundary: present an actionable error to the user.
             self.error.emit(str(exc))
         finally:
+            self.completed.emit(self)
             self.finished.emit()
 
     def cancel(self) -> None:
